@@ -1640,6 +1640,50 @@ class Circuit:
 {pack_section}
     }}"""
 
+        # NOTE: hoisted out of the return f-string below. Nesting an f"""...""" inside
+        # another f"""...""" is PEP 701 syntax and only parses on Python 3.12+, while this
+        # package declares requires-python >=3.10. Keeping it hoisted makes the module import
+        # on 3.10/3.11 as advertised. Output is byte-identical.
+        if pack_bits is None:
+            bench_bool_section = ""
+        else:
+            out_bool_ctype = 'bool' if not has_reductions else out_ctype
+            unpack_comment = ('Unpack packed-word outputs to individual bools'
+                              if not has_reductions else
+                              'Copy per-sample outputs (already unpacked by circuit)')
+            unpack_expr = ('(packed_out[j] >> b) & 1' if not has_reductions
+                           else f'packed_out[b * {n_total} + j]')
+            bench_bool_section = f"""
+// Packs raw bool input, runs packed circuit, unpacks output - no Python packing needed.
+void circuit_bench_bool(
+    const bool   *in_bool,  // (batch_size, {n_in}) bool, row-major
+    {out_bool_ctype}  *out,  // (batch_size, {n_total}) {out_bool_ctype}, row-major
+    int           batch_size)
+{{
+    int n_iter = batch_size / {pack_bits};
+    {ctype} packed_in[{n_in}];
+    {out_ctype} packed_out[{out_n}];
+
+    for (int iter = 0; iter < n_iter; iter++) {{
+
+        // Pack {pack_bits} bool samples per input wire into one {ctype} word
+        for (int k = 0; k < {n_in}; k++) {{
+            {ctype} w = ({ctype})0;
+            for (int b = 0; b < {pack_bits}; b++)
+                w |= ({ctype})in_bool[(iter * {pack_bits} + b) * {n_in} + k] << b;
+            packed_in[k] = w;
+        }}
+
+        circuit(packed_in, packed_out);
+
+        // {unpack_comment}
+        for (int b = 0; b < {pack_bits}; b++)
+            for (int j = 0; j < {n_total}; j++)
+                out[(iter * {pack_bits} + b) * {n_total} + j] =
+                    {unpack_expr};
+    }}
+}}"""
+
         return f"""\
 // Auto-generated circuit - do not edit
 // Gate IDs 0..{n_in - 1} are inputs, {n_in}..{n_in + n_g - 1} are gates
@@ -1667,36 +1711,7 @@ void circuit_bench(
         circuit(in + i * {n_in}, out + i * {out_n});
 }}
 
-{"" if pack_bits is None else f"""
-// Packs raw bool input, runs packed circuit, unpacks output - no Python packing needed.
-void circuit_bench_bool(
-    const bool   *in_bool,  // (batch_size, {n_in}) bool, row-major
-    {'bool' if not has_reductions else out_ctype}  *out,  // (batch_size, {n_total}) {'bool' if not has_reductions else out_ctype}, row-major
-    int           batch_size)
-{{
-    int n_iter = batch_size / {pack_bits};
-    {ctype} packed_in[{n_in}];
-    {out_ctype} packed_out[{out_n}];
-
-    for (int iter = 0; iter < n_iter; iter++) {{
-
-        // Pack {pack_bits} bool samples per input wire into one {ctype} word
-        for (int k = 0; k < {n_in}; k++) {{
-            {ctype} w = ({ctype})0;
-            for (int b = 0; b < {pack_bits}; b++)
-                w |= ({ctype})in_bool[(iter * {pack_bits} + b) * {n_in} + k] << b;
-            packed_in[k] = w;
-        }}
-
-        circuit(packed_in, packed_out);
-
-        // {'Unpack packed-word outputs to individual bools' if not has_reductions else 'Copy per-sample outputs (already unpacked by circuit)'}
-        for (int b = 0; b < {pack_bits}; b++)
-            for (int j = 0; j < {n_total}; j++)
-                out[(iter * {pack_bits} + b) * {n_total} + j] =
-                    {f'(packed_out[j] >> b) & 1' if not has_reductions else f'packed_out[b * {n_total} + j]'};
-    }}
-}}"""}"""
+{bench_bool_section}"""
 
 
     def to_dict(self) -> dict:
