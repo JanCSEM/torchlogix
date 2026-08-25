@@ -75,20 +75,46 @@ class _LogicConvNd(LogicBase):
         else:
             self.receptive_field_size = _triple(receptive_field_size)
             self.in_dim = _triple(in_dim)
-        assert (
-            all(stride <= dim for dim in self.receptive_field_size)
-        ), (
+        _n = _pair if conv_dimension == 2 else _triple
+        assert all(st <= rf for st, rf in zip(_n(stride), self.receptive_field_size)), (
             f"Stride ({stride}) cannot be larger than "
-            f"receptive field size ({receptive_field_size})"
-        )        
-        self.stride = stride
-        self.padding = padding
+            f"receptive field size ({receptive_field_size}) on any axis"
+        )
+
+        # Per-axis, like in_dim and receptive_field_size already are. A scalar is
+        # broadcast, so existing callers are unaffected. Needed for degenerate-axis
+        # stacks: a (1, k_t) temporal kernel over (B, C, 1, T) requires padding
+        # (0, p) -- a scalar pads BOTH axes and turns the height-1 axis into k_t.
+        self.stride = _n(stride)
+        self.padding = _n(padding)
         self.tree_weights = self._init_weights()
         self.connections = self._init_connections()
-        self.kernel_positions = [(in_dim + 2*self.padding - rfs) // self.stride + 1 
-                   for in_dim, rfs in zip(self.in_dim, self.receptive_field_size)]
+        self.kernel_positions = [
+            (d + 2 * pad - rfs) // st + 1
+            for d, pad, rfs, st in zip(self.in_dim, self.padding,
+                                       self.receptive_field_size, self.stride)
+        ]
         self.n_kernel_positions = math.prod(self.kernel_positions)
 
+
+    def _pad(self, x):
+        """Zero-pad the spatial axes only, per axis.
+
+        F.pad consumes pairs from the LAST dimension backwards, so the spatial
+        padding must be reversed. The channel axis is left out of the tuple
+        entirely rather than padded by an explicit (0, 0).
+
+        ⚠ This also fixes 3-D: the previous 6-tuple (p,p,p,p,0,0) applied to a 5-D
+        tensor padded W and H by p and the DEPTH axis by 0, while kernel_positions
+        assumed depth was padded too. Any LogicConv3d with padding > 0 therefore
+        disagreed with its own output shape.
+        """
+        if not any(self.padding):
+            return x
+        pad = []
+        for p in reversed(self.padding):
+            pad.extend((p, p))
+        return torch.nn.functional.pad(x, tuple(pad), mode="constant", value=0)
 
     def _init_weights(self):
         # Initialize tree weights using parametrization
@@ -154,13 +180,7 @@ class _LogicConvNd(LogicBase):
         if self.export_mode:
             return self._forward_export_mode(x)
         
-        if self.padding > 0:
-            x = torch.nn.functional.pad(
-                x,
-                (self.padding, self.padding, self.padding, self.padding, 0, 0),
-                mode="constant",
-                value=0
-            )
+        x = self._pad(x)
         # First level tree indices
         x = self.connections(x, 0)
         # Process first level with einsum contraction
@@ -186,13 +206,7 @@ class _LogicConvNd(LogicBase):
     def _forward_export_mode(self, x):
 
         # Padding
-        if self.padding > 0:
-            x = torch.nn.functional.pad(
-                x,
-                (self.padding, self.padding, self.padding, self.padding, 0, 0),
-                mode="constant",
-                value=0
-            )
+        x = self._pad(x)
 
         # First level
         x = self.connections(x, 0)

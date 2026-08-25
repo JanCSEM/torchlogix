@@ -336,14 +336,13 @@ class FixedConvConnections(Connections):
         else:
             self.receptive_field_size = _triple(receptive_field_size)
             self.in_dim = _triple(in_dim)
-        assert (
-            all(stride <= dim for dim in self.receptive_field_size)
-        ), (
+        _n = _pair if self.conv_dimension == 2 else _triple
+        assert all(st <= rf for st, rf in zip(_n(stride), self.receptive_field_size)), (
             f"Stride ({stride}) cannot be larger than "
-            f"receptive field size ({receptive_field_size})"
+            f"receptive field size ({receptive_field_size}) on any axis"
         )        
-        self.stride = stride
-        self.padding = padding
+        self.stride = _n(stride)
+        self.padding = _n(padding)
         self.channel_group_size = channel_group_size
         if channel_group_size is not None:
             assert channels > channel_group_size, (
@@ -619,7 +618,7 @@ class FixedConvConnections(Connections):
         #h_k, w_k = self.receptive_field_size
 
         # Account for padding
-        padded = [in_dim + 2 * self.padding for in_dim in self.in_dim]
+        padded = [d + 2 * pad for d, pad in zip(self.in_dim, self.padding)]
         #h_padded = h + 2 * self.padding
         #w_padded = w + 2 * self.padding
 
@@ -629,8 +628,8 @@ class FixedConvConnections(Connections):
         )
 
         # Sliding positions
-        starts = [torch.arange(0, p - rcf + 1, self.stride, device=self.device) 
-                  for p, rcf in zip(padded, self.receptive_field_size)]
+        starts = [torch.arange(0, p - rcf + 1, st, device=self.device)
+                  for p, rcf, st in zip(padded, self.receptive_field_size, self.stride)]
         #h_starts = torch.arange(0, padded[0] - self.receptive_field_size[0] + 1, self.stride, device=self.device)
         #w_starts = torch.arange(0, padded[1] - self.receptive_field_size[1] + 1, self.stride, device=self.device)
 

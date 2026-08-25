@@ -11,12 +11,18 @@ def _to_tuple(v, n):
 class OrPooling2d(torch.nn.Module):
     """Logic gate based pooling layer."""
 
-    def __init__(self, kernel_size, stride, padding=0, export_mode=False):
+    def __init__(self, kernel_size, stride, padding=0, export_mode=False,
+                 ceil_mode=False):
         super(OrPooling2d, self).__init__()
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
         self.export_mode = export_mode
+        # ceil_mode keeps the ragged final window instead of discarding it, matching
+        # F.max_pool*d. Needed for time axes that do not divide evenly: a 375-long
+        # axis pooled by 4 is 94 windows with ceil and 93 without, and dropping that
+        # window silently shortens the receptive field of every layer above it.
+        self.ceil_mode = ceil_mode
 
     def forward(self, x):
         """Pool using logical OR (export) or max pooling (normal)."""
@@ -30,6 +36,7 @@ class OrPooling2d(torch.nn.Module):
             kernel_size=self.kernel_size,
             stride=self.stride,
             padding=self.padding,
+            ceil_mode=self.ceil_mode,
         )
 
     def _torch_or_bool(self, x):
@@ -55,12 +62,18 @@ class OrPooling2d(torch.nn.Module):
 class OrPooling3d(torch.nn.Module):
     """Logic gate based pooling layer."""
 
-    def __init__(self, kernel_size, stride, padding=0, export_mode=False):
+    def __init__(self, kernel_size, stride, padding=0, export_mode=False,
+                 ceil_mode=False):
         super(OrPooling3d, self).__init__()
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
         self.export_mode = export_mode
+        # ceil_mode keeps the ragged final window instead of discarding it, matching
+        # F.max_pool*d. Needed for time axes that do not divide evenly: a 375-long
+        # axis pooled by 4 is 94 windows with ceil and 93 without, and dropping that
+        # window silently shortens the receptive field of every layer above it.
+        self.ceil_mode = ceil_mode
 
     def forward(self, x):
 
@@ -74,6 +87,7 @@ class OrPooling3d(torch.nn.Module):
             kernel_size=self.kernel_size,
             stride=self.stride,
             padding=self.padding,
+            ceil_mode=self.ceil_mode,
         )
 
     def _torch_or_pool(self, x):

@@ -78,13 +78,13 @@ class TestIndices:
         [4 because of (w, h, d, c) notation].
         """
         h_positions = (
-            int((layer.in_dim[0] + 2 * layer.padding - layer.receptive_field_size[0]) / layer.stride) + 1
+            int((layer.in_dim[0] + 2 * layer.padding[0] - layer.receptive_field_size[0]) / layer.stride[0]) + 1
         )
         w_positions = (
-            int((layer.in_dim[1] + 2 * layer.padding - layer.receptive_field_size[1]) / layer.stride) + 1
+            int((layer.in_dim[1] + 2 * layer.padding[1] - layer.receptive_field_size[1]) / layer.stride[1]) + 1
         )
         d_positions = (
-            int((layer.in_dim[2] + 2 * layer.padding - layer.receptive_field_size[2]) / layer.stride) + 1
+            int((layer.in_dim[2] + 2 * layer.padding[2] - layer.receptive_field_size[2]) / layer.stride[2]) + 1
         )
         num_positions = h_positions * w_positions * d_positions
         indices = layer.connections.indices[0][side]
