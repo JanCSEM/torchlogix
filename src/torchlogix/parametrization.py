@@ -38,6 +38,15 @@ def setup_parametrization(parametrization: str, lut_rank: int, **parametrization
     return param_cls(lut_rank, **parametrization_kwargs)
 
 
+def _residual_frac_mask(num_neurons: int, frac: float, device) -> torch.Tensor:
+    """Boolean mask, True where a gate should start as the pass-through wire.
+
+    Drawn per gate rather than taking a fixed prefix so the wire/non-wire split is
+    not correlated with anything downstream (channel index, tree position).
+    """
+    return torch.rand(num_neurons, device=device) < frac
+
+
 class LUTParametrization(torch.nn.Module, ABC):
     """Base class for LUT parametrization strategies.
 
@@ -54,6 +63,8 @@ class LUTParametrization(torch.nn.Module, ABC):
         weight_init: str = "residual",
         residual_probability: float = 0.951,
         materialize_basis: bool = False,
+        residual_frac: float = 0.95,
+        residual_logit: float = 4.0,
     ):
         """Initialize parametrization.
 
@@ -82,6 +93,11 @@ class LUTParametrization(torch.nn.Module, ABC):
                 f"forward_sampling must be one of {valid_modes}, got {forward_sampling}"
             )
         self.forward_sampling = forward_sampling
+        # For weight_init="residual-frac": the share of gates that start as the
+        # pass-through wire, and the |logit| every gate is written at. Both wires
+        # and non-wires get the SAME magnitude, so no entry starts undecided.
+        self.residual_frac = float(residual_frac)
+        self.residual_logit = float(residual_logit)
         self.temperature = temperature
         self.weight_init = weight_init
         self.residual_probability = residual_probability
@@ -174,7 +190,11 @@ class RawLUTParametrization(LUTParametrization):
         weight_init: str = "residual",
         residual_probability: float = 0.951,
         materialize_basis: bool = False,
+        **kwargs,
     ):
+        # NOTE: **kwargs is forwarded. Without it every base-class option added
+        # later is silently dropped for these subclasses -- the same failure mode
+        # LearnableBinarization had.
         super().__init__(
             lut_rank,
             forward_sampling,
@@ -182,6 +202,7 @@ class RawLUTParametrization(LUTParametrization):
             weight_init,
             residual_probability,
             materialize_basis,
+            **kwargs,
         )
         if lut_rank != 2:
             raise ValueError("Raw parametrization currently only supports lut_rank=2")
@@ -202,6 +223,22 @@ class RawLUTParametrization(LUTParametrization):
                              - 2**(lut_entries - 1) + 1) - math.log(1 - self.residual_probability)
             weights = torch.zeros((num_neurons, 1 << lut_entries), device=device)
             weights[:, (1 << (1 << (self.lut_rank - 1))) - 1] = value * self.temperature
+            return weights
+        elif self.weight_init == "residual-frac":
+            # Same lever as the light branch: `residual_frac` of gates are the
+            # pass-through wire, the rest a DEFINITE other gate drawn uniformly from
+            # the remaining truth tables, all at the same |logit| so nothing starts
+            # undecided. Here the parameters are gate LOGITS rather than per-address
+            # coefficients, so "pick a table" is "pick an index".
+            n_tables = 1 << lut_entries
+            wire_idx = (1 << (1 << (self.lut_rank - 1))) - 1        # pass-through of A
+            lam = self.residual_logit * self.temperature
+            pick = torch.randint(0, n_tables - 1, (num_neurons,), device=device)
+            pick = pick + (pick >= wire_idx).long()                 # uniform over the OTHERS
+            keep = _residual_frac_mask(num_neurons, self.residual_frac, device)
+            pick[keep] = wire_idx
+            weights = torch.full((num_neurons, n_tables), -lam, device=device)
+            weights.scatter_(1, pick.unsqueeze(1), lam)
             return weights
         elif self.weight_init == "random":
             return torch.randn(num_neurons, 1 << lut_entries, device=device)
@@ -295,7 +332,11 @@ class WarpLUTParametrization(LUTParametrization):
         weight_init: str = "residual",
         residual_probability: float = 0.951,
         materialize_basis: bool = False,
+        **kwargs,
     ):
+        # NOTE: **kwargs is forwarded. Without it every base-class option added
+        # later is silently dropped for these subclasses -- the same failure mode
+        # LearnableBinarization had.
         super().__init__(
             lut_rank,
             forward_sampling,
@@ -303,6 +344,7 @@ class WarpLUTParametrization(LUTParametrization):
             weight_init,
             residual_probability,
             materialize_basis,
+            **kwargs,
         )
         if lut_rank not in [1, 2, 4, 6]:
             raise ValueError(
@@ -440,7 +482,11 @@ class LightLUTParametrization(LUTParametrization):
         weight_init: str = "residual",
         residual_probability: float = 0.951,
         materialize_basis: bool = False,
+        **kwargs,
     ):
+        # NOTE: **kwargs is forwarded. Without it every base-class option added
+        # later is silently dropped for these subclasses -- the same failure mode
+        # LearnableBinarization had.
         super().__init__(
             lut_rank,
             forward_sampling,
@@ -448,6 +494,7 @@ class LightLUTParametrization(LUTParametrization):
             weight_init,
             residual_probability,
             materialize_basis,
+            **kwargs,
         )
         if lut_rank not in [2, 4, 6]:
             raise ValueError(
@@ -466,6 +513,35 @@ class LightLUTParametrization(LUTParametrization):
             weights[:, :lut_entries // 2] -= 3
             weights[:, lut_entries // 2:] += 3
             return weights
+        elif self.weight_init == "residual-frac":
+            # `residual_frac` of gates start as the pass-through wire; the rest as a
+            # DEFINITE other Boolean function, drawn uniformly from the non-wire
+            # truth tables and written at the SAME |logit|. So every entry starts
+            # committed -- 0% undecided -- rather than as weak noise around 0.
+            #
+            # This is NOT the same lever as adding Gaussian noise to a residual
+            # init. The reference records that the noise version (|logit| ~0.79
+            # against wires at 4.0, ~1.2% undecided) measured NULL, while the
+            # committed version moved a matched CIFAR-S pair 0.5834 -> 0.5877.
+            #
+            # ⚠ Address order is MSB-first: light_basis is
+            # [(1-A)(1-B), (1-A)B, A(1-B), AB], so address = 2*A + B and the
+            # pass-through of A is the UPPER half of the table.
+            lam = self.residual_logit
+            a = torch.arange(lut_entries, device=device)
+            wire = (a >= lut_entries // 2).float()                    # pass-through of A
+            tables = (torch.rand(num_neurons, lut_entries, device=device) < 0.5).float()
+            # redraw any accidental wire so the non-wire share is uniform over the
+            # OTHER tables, exactly as specified
+            for _ in range(8):
+                dup = (tables == wire).all(dim=-1)
+                if not dup.any():
+                    break
+                tables[dup] = (torch.rand(int(dup.sum()), lut_entries,
+                                          device=device) < 0.5).float()
+            keep = _residual_frac_mask(num_neurons, self.residual_frac, device)
+            tables[keep] = wire
+            return (tables * 2.0 - 1.0) * lam                          # {0,1} -> -+lam
         elif self.weight_init == "random":
             return torch.rand(num_neurons, lut_entries, device=device)
         else:
