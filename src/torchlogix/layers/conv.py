@@ -28,6 +28,8 @@ class _LogicConvNd(LogicBase):
         stride: Convolution stride in all spatial dimensions.
         padding: Zero-padding applied symmetrically to depth, height and width
             before selecting receptive fields.
+        dilation: Spacing between receptive-field taps, per axis (int or tuple). A
+            kernel of size k spans dilation * (k - 1) + 1 positions. Default 1.
         conv_dimension: Dimension of the convolution (2 or 3).
         device (str): Device to run the layer on ('cpu' or 'cuda').
         grad_factor (float): Gradient scaling factor.
@@ -46,6 +48,7 @@ class _LogicConvNd(LogicBase):
         receptive_field_size: Union[_size_2_t, _size_3_t, int] = 2,
         stride: int = 1,
         padding: int = 0,
+        dilation: int = 1,
         conv_dimension: int = 2,
         device: str = "cpu",
         grad_factor: float = 1.0,
@@ -87,12 +90,16 @@ class _LogicConvNd(LogicBase):
         # (0, p) -- a scalar pads BOTH axes and turns the height-1 axis into k_t.
         self.stride = _n(stride)
         self.padding = _n(padding)
+        # Per-axis like stride/padding: spacing between receptive-field taps (see
+        # FixedConvConnections). Output size follows torch.nn.Conv's formula.
+        self.dilation = _n(dilation)
         self.tree_weights = self._init_weights()
         self.connections = self._init_connections()
         self.kernel_positions = [
-            (d + 2 * pad - rfs) // st + 1
-            for d, pad, rfs, st in zip(self.in_dim, self.padding,
-                                       self.receptive_field_size, self.stride)
+            (d + 2 * pad - dil * (rfs - 1) - 1) // st + 1
+            for d, pad, rfs, st, dil in zip(self.in_dim, self.padding,
+                                            self.receptive_field_size, self.stride,
+                                            self.dilation)
         ]
         self.n_kernel_positions = math.prod(self.kernel_positions)
 
@@ -147,6 +154,7 @@ class _LogicConvNd(LogicBase):
             conv_dimension=self.conv_dimension,
             stride=self.stride,
             padding=self.padding,
+            dilation=self.dilation,
             **self.connections_kwargs
         )
         return self.connections
@@ -174,8 +182,8 @@ class _LogicConvNd(LogicBase):
             where ``out_height`` and ``out_width`` are determined by the
             convolution parameters:
 
-            * ``out_height = (in_height + 2 * padding - receptive_field_size) // stride + 1``
-            * ``out_width  = (in_width  + 2 * padding - receptive_field_size) // stride + 1``.
+            * ``out_height = (in_height + 2 * padding - dilation * (receptive_field_size - 1) - 1) // stride + 1``
+            * ``out_width  = (in_width  + 2 * padding - dilation * (receptive_field_size - 1) - 1) // stride + 1``.
         """
         if self.export_mode:
             return self._forward_export_mode(x)
@@ -317,6 +325,7 @@ class LogicConv2d(_LogicConvNd):
         receptive_field_size: Union[_size_2_t, int] = 2,
         stride: int = 1,
         padding: int = 0,
+        dilation: int = 1,
         device: str = "cpu",
         grad_factor: float = 1.0,
         lut_rank: int = 2,
@@ -333,6 +342,7 @@ class LogicConv2d(_LogicConvNd):
             receptive_field_size=receptive_field_size,
             stride=stride,
             padding=padding,
+            dilation=dilation,
             conv_dimension=2,
             device=device,
             grad_factor=grad_factor,
@@ -362,6 +372,7 @@ class LogicConv3d(_LogicConvNd):
         receptive_field_size: Union[_size_3_t, int] = 2,
         stride: int = 1,
         padding: int = 0,
+        dilation: int = 1,
         device: str = "cpu",
         grad_factor: float = 1.0,
         lut_rank: int = 2,
@@ -378,6 +389,7 @@ class LogicConv3d(_LogicConvNd):
             receptive_field_size=receptive_field_size,
             stride=stride,
             padding=padding,
+            dilation=dilation,
             conv_dimension=3,
             device=device,
             grad_factor=grad_factor,

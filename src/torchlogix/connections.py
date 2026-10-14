@@ -45,19 +45,75 @@ def setup_connections(
         raise ValueError(f"Unknown structure method: {structure}")
     
 
+
+def repair_duplicate_inputs(slots: torch.Tensor, max_rounds: int = 1000) -> torch.Tensor:
+    """Make every gate read ``lut_rank`` DISTINCT inputs, in place, by swapping slots.
+
+    ``slots`` is ``(n_gates, lut_rank, *coord)``: one input coordinate (an index, or a
+    tap tuple) per gate input. A gate whose inputs coincide computes a function of fewer
+    inputs than it pays for. Each offending slot is swapped with a uniformly random other
+    slot, so the MULTISET of slots is unchanged -- per-channel leaf counts and input
+    coverage survive exactly -- and only the pairing moves. Raises if the slots cannot be
+    made distinct (e.g. fewer distinct values than ``lut_rank``).
+    """
+    n, L = slots.shape[0], slots.shape[1]
+    flat = slots.reshape(n * L, -1)
+    eye = torch.eye(L, dtype=torch.bool, device=slots.device)
+    for _ in range(max_rounds):
+        g = flat.view(n, L, -1)
+        same = (g.unsqueeze(1) == g.unsqueeze(2)).all(-1) & ~eye        # (n, L, L)
+        dup = same.any(-1).any(-1)
+        if not dup.any():
+            return slots
+        for j in torch.nonzero(dup).flatten().tolist():
+            a, b = torch.nonzero(torch.triu(same[j], diagonal=1))[0].tolist()
+            s = j * L + b
+            r = int(torch.randint(0, n * L, (1,), device=slots.device))
+            tmp = flat[s].clone()
+            flat[s] = flat[r]
+            flat[r] = tmp
+    raise ValueError("could not give every gate distinct inputs: too few distinct "
+                     "candidates for lut_rank")
+
+
+# Default connection draw for layers that do not pass `init_method` explicitly.
+# "random" is the historical draw (inputs with replacement). A caller can switch every
+# layer built inside a block, without threading an argument through each builder:
+#     with default_init_method("random-distinct"):
+#         model = build(...)
+_DEFAULT_INIT_METHOD = "random"
+
+
+class default_init_method:
+    """Context manager: the connection init method used when a layer passes None."""
+
+    def __init__(self, method: str):
+        self.method = method
+
+    def __enter__(self):
+        global _DEFAULT_INIT_METHOD
+        self._prev, _DEFAULT_INIT_METHOD = _DEFAULT_INIT_METHOD, self.method
+        return self
+
+    def __exit__(self, *exc):
+        global _DEFAULT_INIT_METHOD
+        _DEFAULT_INIT_METHOD = self._prev
+        return False
+
+
 class Connections(torch.nn.Module, ABC):
     """Abstract base class for connection strategies."""
     def __init__(
             self,
             lut_rank=2,
             device=None,
-            init_method="random",
+            init_method=None,
             **kwargs
         ):
         super().__init__()
         self.lut_rank = lut_rank
         self.device = device
-        self.init_method = init_method
+        self.init_method = init_method if init_method is not None else _DEFAULT_INIT_METHOD
 
     @abstractmethod
     def forward(self, x):
@@ -84,6 +140,12 @@ class FixedDenseConnections(Connections):
         init_method: Method to initialize connections. Options are:
             - "random": Randomly select input features (with replacement).
             - "random-unique": Randomly select unique input features (without replacement).
+            - "random-distinct": like "random" (balanced coverage), but the ``lut_rank``
+              inputs of each neuron are distinct.
+        relabel: Randomly permute input ids after the draw. ``randperm(k*n) % in_dim``
+            gives the ``(k*n) % in_dim`` extra reads to inputs ``0..r-1``, i.e. always the
+            FIRST inputs (for a flattened conv output: the first channels). Relabelling
+            spreads them over random inputs (SilentWear ``get_connections``).
     """
     def __init__(
             self, 
@@ -91,7 +153,8 @@ class FixedDenseConnections(Connections):
             out_dim, 
             lut_rank=2, 
             device=None,
-            init_method="random",
+            init_method=None,
+            relabel: bool = False,
             **kwargs
         ):
         super().__init__(
@@ -102,6 +165,7 @@ class FixedDenseConnections(Connections):
         )
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.relabel = bool(relabel)
         self.register_buffer('indices', self._init_connections())
 
     def _init_connections(self):
@@ -124,11 +188,17 @@ class FixedDenseConnections(Connections):
                 f"({self.out_dim} * {self.lut_rank} < {self.in_dim})."
                 )
 
-        if self.init_method == "random":
-            # With this method both inputs can stem from the same input feature
+        if self.init_method in ("random", "random-distinct"):
+            # "random": both inputs can stem from the same input feature
             c = torch.randperm(self.lut_rank * self.out_dim, 
                                device=self.device) % self.in_dim
             c = c.reshape(self.lut_rank, self.out_dim)
+            if self.init_method == "random-distinct":
+                per_gate = c.t().contiguous().view(self.out_dim, self.lut_rank, 1)
+                repair_duplicate_inputs(per_gate)
+                c = per_gate.view(self.out_dim, self.lut_rank).t()
+            if self.relabel:
+                c = torch.randperm(self.in_dim, device=self.device)[c]
         elif self.init_method == "random-unique":
             c = get_random_unique_connections(
                 in_dim=self.in_dim,
@@ -137,6 +207,8 @@ class FixedDenseConnections(Connections):
             )
         else:
             raise ValueError(self.init_method)
+        if self.relabel and self.init_method == "random-unique":
+            raise ValueError("relabel is already part of random-unique; pass relabel=False")
         c = c.contiguous().to(torch.int64).to(self.device)
         return c
     
@@ -204,7 +276,7 @@ class LearnableDenseConnections(Connections):
             num_candidates=-1, 
             gumbel=False,
             device=None,
-            init_method="random",
+            init_method=None,
             **kwargs
         ):
         super().__init__(
@@ -259,11 +331,17 @@ class LearnableDenseConnections(Connections):
                 f"({self.out_dim} * {self.lut_rank} < {self.in_dim})."
                 )
 
-        if self.init_method == "random":
-            # With this method both inputs can stem from the same input feature
+        if self.init_method in ("random", "random-distinct"):
+            # "random": both inputs can stem from the same input feature
             c = torch.randperm(self.lut_rank * self.out_dim * self.num_candidates, 
                                device=self.device) % self.in_dim
             c = c.reshape(self.num_candidates, self.lut_rank, self.out_dim)
+            if self.init_method == "random-distinct":
+                # each (candidate, neuron) tuple reads lut_rank distinct inputs
+                per_gate = c.permute(0, 2, 1).reshape(-1, self.lut_rank, 1).contiguous()
+                repair_duplicate_inputs(per_gate)
+                c = per_gate.view(self.num_candidates, self.out_dim,
+                                  self.lut_rank).permute(0, 2, 1)
         elif self.init_method == "random-unique":
             c = get_random_unique_connections(
                 in_dim=self.in_dim,
@@ -315,8 +393,10 @@ class FixedConvConnections(Connections):
             conv_dimension: int = 2,
             lut_rank=2, 
             device=None,
-            init_method="random",  # | "random-unique"
+            dilation: int = 1,
+            init_method=None,  # | "random" | "random-unique" | "random-distinct"
             channel_group_size: int = None,
+            channel_groups: int = None,
             **kwargs
         ):
         super().__init__(
@@ -343,10 +423,34 @@ class FixedConvConnections(Connections):
         )        
         self.stride = _n(stride)
         self.padding = _n(padding)
+        # Dilation spaces the receptive-field taps `dilation` apart along each axis, as in
+        # torch.nn.Conv: a kernel of size k then spans dilation * (k - 1) + 1 positions.
+        # Leaves are still SAMPLED over the k taps per axis, so dilation=1 draws exactly
+        # the same random connections as before.
+        self.dilation = _n(dilation)
+        assert all(d >= 1 for d in self.dilation), f"dilation must be >= 1, got {dilation}"
+        self.extent = tuple(d * (k - 1) + 1
+                            for d, k in zip(self.dilation, self.receptive_field_size))
+        # channel_groups=G: PRIVATE kernels per input block, like torch.nn.Conv's
+        # `groups`. Input channels split into G contiguous blocks and kernel k belongs
+        # to block k // (num_kernels // G); every leaf of that kernel reads only its
+        # block. Weights are per kernel already, so this alone makes kernels private,
+        # e.g. per electrode in a folded (B, electrodes*bits, 1, T) layout.
+        # channel_group_size (if set) then picks a contiguous window INSIDE the block.
+        self.channel_groups = int(channel_groups) if channel_groups else None
+        if self.channel_groups:
+            assert channels % self.channel_groups == 0, (
+                f"channels ({channels}) must be divisible by channel_groups "
+                f"({self.channel_groups})")
+            assert num_kernels % self.channel_groups == 0, (
+                f"num_kernels ({num_kernels}) must be divisible by channel_groups "
+                f"({self.channel_groups})")
         self.channel_group_size = channel_group_size
         if channel_group_size is not None:
-            assert channels > channel_group_size, (
-                "channel_group_size must be smaller than the number of channels"
+            per_block = channels // (self.channel_groups or 1)
+            assert per_block > channel_group_size, (
+                "channel_group_size must be smaller than the number of channels "
+                "(per block when channel_groups is set)"
             )
         for i, tensor in enumerate(self._init_connections()):
             self.register_buffer(f'_indices_L{i}', tensor)
@@ -362,12 +466,18 @@ class FixedConvConnections(Connections):
 
     def _init_connections(self):
         # Setup connections
-        if self.init_method == "random":
+        if self.init_method in ("random", "random-distinct"):
             kernels = self._get_random_receptive_field_tensor()
         elif self.init_method == "random-unique":
+            if self.channel_groups:
+                raise ValueError("channel_groups is not implemented for random-unique")
             kernels = self._get_random_unique_receptive_field_tensor()
         else:
             raise ValueError(f"Unknown connections type: {self.init_method}")
+        if any(d > 1 for d in self.dilation):
+            # tap index -> position offset; the trailing channel coordinate is unscaled
+            scale = torch.tensor([*self.dilation, 1], device=kernels.device)
+            kernels = kernels * scale
         # Build tree indices
         return self._get_indices_from_kernel_tensor(kernels)
 
@@ -404,18 +514,28 @@ class FixedConvConnections(Connections):
         # ---------------------------
         # Channel group setup
         # ---------------------------
+        # Private blocks (channel_groups): kernel k lives in block k // kpb and sees only
+        # that block's channels; everything below is then the ungrouped rule applied to
+        # the block, with the kernel's LOCAL index. Without blocks this is exactly the
+        # historical code path (block 0 = all channels, local index = k).
+        G = self.channel_groups or 1
+        c_blk = c // G
+        kpb = self.num_kernels // G
+        distinct = self.init_method == "random-distinct"
         if g is None:
             starts = None
         else:
-            starts = torch.arange(0, c - g + 1, device=device)
+            starts = torch.arange(0, c_blk - g + 1, device=device)
             num_groups = starts.numel()
 
         coords_per_kernel = []
 
         for k in range(self.num_kernels):
+            base = (k // kpb) * c_blk
+            k_loc = k % kpb
 
             if g is None:
-                c_rf = torch.arange(0, c, device=device)
+                c_rf = base + torch.arange(0, c_blk, device=device)
 
                 # full 3D position space
                 grid = torch.meshgrid(*rf_axes, c_rf, indexing="ij")
@@ -424,16 +544,25 @@ class FixedConvConnections(Connections):
                 )
                 num_positions = all_positions.shape[0]
 
-                idx = torch.randint(
-                    0, num_positions,
-                    (sample_size, self.lut_rank),
-                    device=device,
-                )
+                if distinct:
+                    if num_positions < self.lut_rank:
+                        raise ValueError(
+                            f"random-distinct needs >= {self.lut_rank} candidate inputs "
+                            f"per kernel, got {num_positions}")
+                    # uniform over ordered tuples of DISTINCT positions
+                    idx = torch.rand(sample_size, num_positions,
+                                     device=device).argsort(dim=1)[:, :self.lut_rank]
+                else:
+                    idx = torch.randint(
+                        0, num_positions,
+                        (sample_size, self.lut_rank),
+                        device=device,
+                    )
 
                 coords_k = all_positions[idx]
 
             else:
-                start = starts[k % num_groups]
+                start = base + starts[k_loc % num_groups]
                 c_rf = start + torch.arange(g, device=device)
 
                 if total_inputs % g != 0:
@@ -468,7 +597,10 @@ class FixedConvConnections(Connections):
                 perm = torch.randperm(total_inputs, device=device)
                 coords_k = coords_k[perm]
 
-                coords_k = coords_k.view(sample_size, self.lut_rank, 3)
+                coords_k = coords_k.view(sample_size, self.lut_rank, coords_k.shape[-1])
+                if distinct:
+                    # same per-channel leaf counts; only the pairing changes
+                    repair_duplicate_inputs(coords_k)
 
             coords_per_kernel.append(coords_k)
 
@@ -622,14 +754,15 @@ class FixedConvConnections(Connections):
         #h_padded = h + 2 * self.padding
         #w_padded = w + 2 * self.padding
 
-        assert all(rfs <= p for rfs, p in zip(self.receptive_field_size, padded)), (
-            f"Receptive field size {self.receptive_field_size} must fit within input "
-            f"dimensions {padded} after padding."
+        assert all(ext <= p for ext, p in zip(self.extent, padded)), (
+            f"Receptive field size {self.receptive_field_size} (extent {self.extent} at "
+            f"dilation {self.dilation}) must fit within input dimensions {padded} after "
+            f"padding."
         )
 
         # Sliding positions
-        starts = [torch.arange(0, p - rcf + 1, st, device=self.device)
-                  for p, rcf, st in zip(padded, self.receptive_field_size, self.stride)]
+        starts = [torch.arange(0, p - ext + 1, st, device=self.device)
+                  for p, ext, st in zip(padded, self.extent, self.stride)]
         #h_starts = torch.arange(0, padded[0] - self.receptive_field_size[0] + 1, self.stride, device=self.device)
         #w_starts = torch.arange(0, padded[1] - self.receptive_field_size[1] + 1, self.stride, device=self.device)
 
