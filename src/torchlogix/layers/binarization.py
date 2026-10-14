@@ -379,9 +379,20 @@ class LearnableBinarization(Binarization):
         temperature_softplus=0.1,
         forward_sampling="soft", 
         max_grad_norm=0.001,
+        min_gap=0.0,
         **kwargs
     ):
         self.forward_sampling = forward_sampling
+        # ⚠ min_gap FLOORS THE SPACING BETWEEN ADJACENT THRESHOLDS. Without it the
+        # optimiser will happily COLLAPSE two levels onto each other, which silently
+        # costs an input bit: a thermometer code whose thresholds coincide has a
+        # duplicate bit carrying no information. Measured on CIFAR-M: thresholds
+        # initialised at [0.25, 0.50, 0.75] were driven to [0.2516, 0.5137, 0.5137]
+        # -- the top two equal to 1.4e-7 -- so a 3-bit config trained a 2-level code.
+        # Lowering the threshold learning rate only slows this down; the gradient
+        # genuinely prefers the coarser encoding, so the floor is what removes it.
+        # 0.0 reproduces the historical (unconstrained) behaviour exactly.
+        self.min_gap = float(min_gap)
         # NOTE: **kwargs was previously dropped here, so any base-class option
         # (thresh_jitter among them) was silently ignored for this class only.
         super().__init__(thresholds, feature_dim, **kwargs)
@@ -389,7 +400,19 @@ class LearnableBinarization(Binarization):
         self.temperature_softplus = temperature_softplus
         diffs = torch.diff(self.thresholds, 
                            prepend=self.thresholds.new_zeros(*self.thresholds.shape[:-1], 1), dim=-1)
-        self.raw_diffs = torch.nn.Parameter(diffs)
+        # ⚠ INVERT THE FORWARD TRANSFORM SO THE LAYER STARTS WHERE IT WAS ASKED TO.
+        # raw_diffs used to store the target diffs VERBATIM, but _raw_thresholds() then
+        # pushes everything past index 0 through `T*softplus(x/T)` (+ min_gap), so the
+        # effective start was NOT the requested grid: thresholds=[0.25,0.50,0.75] began
+        # life at [0.25, 0.5079, 0.7658] at T=0.1, and further off for larger T. Storing
+        # the pre-image makes init exact for any temperature and any min_gap, so a
+        # learnable arm starts from the same encoding as the fixed-threshold control it
+        # is compared against.
+        T = self.temperature_softplus + 1e-6
+        rest = (diffs[..., 1:] - self.min_gap).clamp_min(1e-6) / T
+        rest = T * (rest + torch.log(-torch.expm1(-rest)))      # stable softplus inverse
+        self.raw_diffs = torch.nn.Parameter(
+            torch.cat([diffs[..., :1], rest], dim=-1) if diffs.shape[-1] > 1 else diffs)
         self.raw_diffs.register_hook(self._clip_grad)
         self._max_grad_norm = max_grad_norm
 
@@ -401,26 +424,34 @@ class LearnableBinarization(Binarization):
             
     def _raw_thresholds(self):
         # Renamed from get_thresholds: the base class now owns get_thresholds() and
-        # applies jitter on top of whatever this returns. Body unchanged.
-        if self.training:
-            # first diff can be negative: global shift
-            first_diff = self.raw_diffs[..., :1]  # unconstrained
+        # applies jitter on top of whatever this returns.
+        #
+        # ⚠ THE POSITIVITY TRANSFORM MUST APPLY IN BOTH MODES. This previously ran the
+        # softplus only under `if self.training` and used a bare cumsum(raw_diffs) at
+        # eval, so the network optimised one threshold grid and was evaluated on a
+        # different one. They agree only while raw_diffs sits near its init, which is
+        # why the discrepancy is invisible at step 0 and grows with training. Once any
+        # learned diff goes negative the eval grid becomes NON-MONOTONE -- measured
+        # train [0.35, 0.397, 0.445] against eval [0.35, 0.30, 0.25] -- and a
+        # thermometer code with decreasing thresholds is meaningless, since bit i fires
+        # on x > t_i. Observed downstream as CIFAR-M eval accuracy 0.28-0.31 against a
+        # 0.65 control while the TRAINING loss looked healthy.
+        #
+        # The softplus is what guarantees a monotone grid, so eval needs it at least as
+        # much as training does.
+        first_diff = self.raw_diffs[..., :1]  # unconstrained: a global shift
 
-            # remaining diffs are positive
-            if self.raw_diffs.shape[-1] > 1:
-                rest_diffs = (self.temperature_softplus + 1e-6) * F.softplus(
-                    self.raw_diffs[..., 1:] / (self.temperature_softplus + 1e-6)
-                )
-                diffs_pos = torch.cat([first_diff, rest_diffs], dim=-1)
-            else:
-                diffs_pos = first_diff
-
-            thresholds = torch.cumsum(diffs_pos, dim=-1)
-
+        if self.raw_diffs.shape[-1] > 1:
+            rest_diffs = (self.temperature_softplus + 1e-6) * F.softplus(
+                self.raw_diffs[..., 1:] / (self.temperature_softplus + 1e-6)
+            )
+            if self.min_gap:
+                rest_diffs = rest_diffs + self.min_gap
+            diffs_pos = torch.cat([first_diff, rest_diffs], dim=-1)
         else:
-            thresholds = torch.cumsum(self.raw_diffs, dim=-1)
+            diffs_pos = first_diff
 
-        return thresholds        
+        return torch.cumsum(diffs_pos, dim=-1)
 
     def _sample_train(self, x: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
         """Apply sigmoid/gumbel_sigmoid based on forward_sampling mode."""
