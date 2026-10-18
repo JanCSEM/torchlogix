@@ -101,6 +101,46 @@ class default_init_method:
         return False
 
 
+# Default leaf-tap draw of the conv trees (FixedConvConnections). "replace" is the
+# historical draw (taps with replacement); "no-replace" draws the 2^d leaf taps of a tree
+# without replacement from the tree's candidate pool (see FixedConvConnections).
+_DEFAULT_TREE_TAP_DRAW = "replace"
+_TREE_TAP_DRAWS = ("replace", "no-replace")
+
+
+class default_tree_tap_draw:
+    """Context manager: the conv-tree leaf-tap draw used when a layer passes None."""
+
+    def __init__(self, mode: str):
+        if mode not in _TREE_TAP_DRAWS:
+            raise ValueError(f"tree_tap_draw must be one of {_TREE_TAP_DRAWS}, got {mode!r}")
+        self.mode = mode
+
+    def __enter__(self):
+        global _DEFAULT_TREE_TAP_DRAW
+        self._prev, _DEFAULT_TREE_TAP_DRAW = _DEFAULT_TREE_TAP_DRAW, self.mode
+        return self
+
+    def __exit__(self, *exc):
+        global _DEFAULT_TREE_TAP_DRAW
+        _DEFAULT_TREE_TAP_DRAW = self._prev
+        return False
+
+
+def draw_without_replacement(n_pool: int, n_draw: int, device=None) -> torch.Tensor:
+    """``n_draw`` indices into a pool of ``n_pool``, uniformly random order.
+
+    n_draw <= n_pool: one without-replacement pass. n_draw > n_pool (refill): complete
+    passes over the pool, then the remainder by one more pass, so every index appears
+    floor(n_draw / n_pool) or ceil(n_draw / n_pool) times.
+    """
+    full, rem = divmod(n_draw, n_pool)
+    parts = [torch.randperm(n_pool, device=device) for _ in range(full)]
+    if rem:
+        parts.append(torch.randperm(n_pool, device=device)[:rem])
+    return torch.cat(parts)
+
+
 class Connections(torch.nn.Module, ABC):
     """Abstract base class for connection strategies."""
     def __init__(
@@ -397,6 +437,7 @@ class FixedConvConnections(Connections):
             init_method=None,  # | "random" | "random-unique" | "random-distinct"
             channel_group_size: int = None,
             channel_groups: int = None,
+            tree_tap_draw: str = None,  # None -> default_tree_tap_draw | "replace" | "no-replace"
             **kwargs
         ):
         super().__init__(
@@ -405,6 +446,11 @@ class FixedConvConnections(Connections):
             init_method=init_method,
             **kwargs
         )
+        self.tree_tap_draw = (tree_tap_draw if tree_tap_draw is not None
+                              else _DEFAULT_TREE_TAP_DRAW)
+        if self.tree_tap_draw not in _TREE_TAP_DRAWS:
+            raise ValueError(f"tree_tap_draw must be one of {_TREE_TAP_DRAWS}, "
+                             f"got {self.tree_tap_draw!r}")
         self.num_kernels = num_kernels
         self.tree_depth = tree_depth
         self.channels = channels
@@ -469,6 +515,8 @@ class FixedConvConnections(Connections):
         if self.init_method in ("random", "random-distinct"):
             kernels = self._get_random_receptive_field_tensor()
         elif self.init_method == "random-unique":
+            if self.tree_tap_draw != "replace":
+                raise ValueError("tree_tap_draw=no-replace is not implemented for random-unique")
             if self.channel_groups:
                 raise ValueError("channel_groups is not implemented for random-unique")
             kernels = self._get_random_unique_receptive_field_tensor()
@@ -482,9 +530,29 @@ class FixedConvConnections(Connections):
         return self._get_indices_from_kernel_tensor(kernels)
 
 
+    def pool_report(self):
+        """Candidate pool of one tree, for the dry-run (tree_tap_draw rule).
+
+        pool = ke * kt * (channels the tree may read); windowed layers also report the
+        per-channel sub-pool (ke * kt) and leaves per channel.
+        """
+        rf = 1
+        for d in self.receptive_field_size:
+            rf *= d
+        leaves = self.lut_rank ** self.tree_depth
+        c_blk = self.channels // (self.channel_groups or 1)
+        g = self.channel_group_size
+        if g is None:
+            pool, sub, per_ch = rf * c_blk, None, None
+        else:
+            pool, sub, per_ch = rf * g, rf, leaves // g
+        return {"tree_tap_draw": self.tree_tap_draw, "pool": pool, "leaves": leaves,
+                "window": g, "sub_pool": sub, "leaves_per_channel": per_ch,
+                "refill": leaves > pool}
+
     def _get_random_receptive_field_tensor(self):
         """
-        Random sampling (with replacement).
+        Random sampling (with replacement unless tree_tap_draw="no-replace").
 
         Returns:
             coords: (lut_rank, num_kernels, sample_size, 3)
@@ -522,6 +590,7 @@ class FixedConvConnections(Connections):
         c_blk = c // G
         kpb = self.num_kernels // G
         distinct = self.init_method == "random-distinct"
+        no_replace = self.tree_tap_draw == "no-replace"
         if g is None:
             starts = None
         else:
@@ -544,7 +613,12 @@ class FixedConvConnections(Connections):
                 )
                 num_positions = all_positions.shape[0]
 
-                if distinct:
+                if no_replace:
+                    # tree rule: the sample_size * lut_rank leaf taps are distinct
+                    # positions of the pool (refill only if the pool is smaller)
+                    idx = draw_without_replacement(
+                        num_positions, total_inputs, device).view(sample_size, self.lut_rank)
+                elif distinct:
                     if num_positions < self.lut_rank:
                         raise ValueError(
                             f"random-distinct needs >= {self.lut_rank} candidate inputs "
@@ -574,11 +648,16 @@ class FixedConvConnections(Connections):
                 channel_chunks = []
 
                 for channel in c_rf:
-                    idx = torch.randint(
-                        0, num_spatial,
-                        (inputs_per_channel,),
-                        device=device,
-                    )
+                    if no_replace:
+                        # tree rule: without replacement within this channel's sub-pool
+                        idx = draw_without_replacement(
+                            num_spatial, inputs_per_channel, device)
+                    else:
+                        idx = torch.randint(
+                            0, num_spatial,
+                            (inputs_per_channel,),
+                            device=device,
+                        )
 
                     chosen = spatial_positions[idx]
 
