@@ -85,23 +85,25 @@ __global__ void fwd_kernel(const TX* __restrict__ x, const int* __restrict__ lea
                            TY* __restrict__ y, uint8_t* __restrict__ arg,
                            int B, int K, int P, int Q, int Nsrc, int WIN, bool store_arg) {
   constexpr int S0 = Dims<D>::S0;
-  const int k = blockIdx.y;
   const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= (long)B * Q) return;
   const int b = (int)(i / Q), q = (int)(i % Q);
   float v[S0];
-  float best = -INFINITY;
-  int barg = 0;
-  for (int j = 0; j < WIN; ++j) {
-    const int p = pos[(long)q * WIN + j];
-    if (p < 0) continue;
-    const int* lf = leaf + ((long)k * P + p) * 2 * S0;
-    const float r = tree_root<TX, D>(x + (long)b * Nsrc, lf, w, K, k, v);
-    if (r > best) { best = r; barg = j; }
+  // grid.y is capped at 65535: each block walks the kernel indices k = y, y + gridDim.y, ...
+  for (int k = blockIdx.y; k < K; k += gridDim.y) {
+    float best = -INFINITY;
+    int barg = 0;
+    for (int j = 0; j < WIN; ++j) {
+      const int p = pos[(long)q * WIN + j];
+      if (p < 0) continue;
+      const int* lf = leaf + ((long)k * P + p) * 2 * S0;
+      const float r = tree_root<TX, D>(x + (long)b * Nsrc, lf, w, K, k, v);
+      if (r > best) { best = r; barg = j; }
+    }
+    const long o = ((long)b * K + k) * Q + q;
+    st(y + o, best);
+    if (store_arg) arg[o] = (uint8_t)barg;
   }
-  const long o = ((long)b * K + k) * Q + q;
-  st(y + o, best);
-  if (store_arg) arg[o] = (uint8_t)barg;
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -119,7 +121,8 @@ __global__ void bwd_kernel(const TG* __restrict__ gy, const TX* __restrict__ x,
                            int B, int K, int P, int Q, int Nsrc, int WIN, bool need_gx) {
   constexpr int S0 = Dims<D>::S0;
   constexpr bool BIN = std::is_same<TX, uint8_t>::value;
-  const int k = blockIdx.y;
+  // every lane of a warp runs the same k iterations, so the shuffles below stay uniform
+  for (int k = blockIdx.y; k < K; k += gridDim.y) {
   const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
   const bool valid = i < (long)B * Q;
   const int bi = valid ? (int)(i / Q) : 0, q = valid ? (int)(i % Q) : 0;
@@ -205,6 +208,7 @@ __global__ void bwd_kernel(const TG* __restrict__ gy, const TX* __restrict__ x,
       for (int jj = 0; jj < 2 * n; ++jj) g[jj] = gn[jj];
     }
   }
+  }
 }
 
 #define LAUNCH_FWD(TX, TY, D)                                                              \
@@ -229,7 +233,8 @@ std::vector<torch::Tensor> fwd(torch::Tensor x, torch::Tensor leaf, torch::Tenso
   torch::Tensor arg = store_arg ? torch::empty({B, K, Q}, x.options().dtype(torch::kUInt8))
                                 : torch::empty({0}, x.options().dtype(torch::kUInt8));
   const int threads = 128;
-  dim3 block(threads), grid((unsigned)(((long)B * Q + threads - 1) / threads), K);
+  dim3 block(threads), grid((unsigned)(((long)B * Q + threads - 1) / threads),
+            (unsigned)std::min<long>(K, 65535));
   auto stream = at::cuda::getCurrentCUDAStream();
   const auto xt = x.scalar_type();
   if (xt == torch::kFloat32) {
@@ -267,7 +272,8 @@ std::vector<torch::Tensor> bwd(torch::Tensor gy, torch::Tensor x, torch::Tensor 
   torch::Tensor gx = need_gx ? torch::zeros({B, Nsrc}, x.options().dtype(torch::kFloat32))
                              : torch::empty({0}, x.options().dtype(torch::kFloat32));
   const int threads = 128;
-  dim3 block(threads), grid((unsigned)(((long)B * Q + threads - 1) / threads), K);
+  dim3 block(threads), grid((unsigned)(((long)B * Q + threads - 1) / threads),
+            (unsigned)std::min<long>(K, 65535));
   auto stream = at::cuda::getCurrentCUDAStream();
   const auto xt = x.scalar_type();
   const bool g_bf16 = gy.scalar_type() == torch::kBFloat16;

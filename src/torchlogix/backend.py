@@ -109,9 +109,10 @@ def set_backend(model, lut_backend="torch", lut_compile=False, eval_backend="tor
                and precision == "fp32")
     if precision == "bf16" and not (lut_backend == "fused"
                                     or (lut_backend == "lookup" and lut_compile)):
-        raise ValueError("precision=bf16 is supported with lut_backend=fused, or "
-                         "lut_backend=lookup + lut_compile (uncompiled torch/lookup would "
-                         "compute in bf16 throughout, a different numerics class)")
+        raise ValueError("precision must be fp32 here: bf16 is supported with "
+                         "lut_backend=fused, or lut_backend=lookup + lut_compile (uncompiled "
+                         "torch/lookup would compute in bf16 throughout, a different "
+                         "numerics class)")
     layers = logic_layers(model)
     if not default:
         for m in layers:

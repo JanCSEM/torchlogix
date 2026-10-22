@@ -189,6 +189,13 @@ def _block(depth: int) -> int:
     return 128 if depth <= 3 else 64
 
 
+def _grid(k, items, block):
+    g = (k, triton.cdiv(items, block))
+    if g[1] > 65535:
+        raise ValueError(f"{items} items / {block} per program exceeds the CUDA grid-y limit")
+    return g
+
+
 def fwd(x, leaf, pos, w, depth, binary, out_dtype, need_arg):
     b, nsrc = x.shape
     k, p = leaf.shape[0], leaf.shape[1]
@@ -198,7 +205,7 @@ def fwd(x, leaf, pos, w, depth, binary, out_dtype, need_arg):
     arg = torch.empty(b, k, q, dtype=torch.uint8, device=x.device) if store_arg else \
         torch.empty(0, dtype=torch.uint8, device=x.device)
     block = _block(depth)
-    grid = (k, triton.cdiv(b * q, block))
+    grid = _grid(k, b * q, block)
     _fwd_kernel[grid](x, leaf, pos, w, y, arg, b, k, p, q, nsrc,
                       D=depth, WIN=win, BINARY=binary, OUT_BF16=(out_dtype == torch.bfloat16),
                       STORE_ARG=store_arg, BLOCK=block, enable_fp_fusion=False)
@@ -213,7 +220,7 @@ def bwd(gy, x, leaf, pos, arg, w, depth, binary, need_gx):
     gx = torch.zeros(b, nsrc, dtype=torch.float32, device=x.device) if need_gx else \
         torch.empty(0, dtype=torch.float32, device=x.device)
     block = _block(depth)
-    grid = (k, triton.cdiv(b * q, block))
+    grid = _grid(k, b * q, block)
     _bwd_kernel[grid](gy.contiguous(), x, leaf, pos, arg, w, gx, gw, b, k, p, q, nsrc,
                       D=depth, WIN=win, BINARY=binary, NEED_GX=need_gx and not binary,
                       BLOCK=block, enable_fp_fusion=False)

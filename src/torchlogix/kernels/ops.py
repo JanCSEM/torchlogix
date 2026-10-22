@@ -113,6 +113,6 @@ tree_fwd.register_autograd(_backward, setup_context=_setup)
 
 def tree(x: torch.Tensor, leaf, pos, w, depth: int, binary: bool, out_bf16: bool) -> torch.Tensor:
     """Run the fused tree op; returns y (B, K, Q)."""
-    need_arg = bool(torch.is_grad_enabled() and w.requires_grad)
+    need_arg = bool(torch.is_grad_enabled() and (w.requires_grad or x.requires_grad))
     y, _ = tree_fwd(x, leaf, pos, w, depth, binary, out_bf16, need_arg)
     return y
