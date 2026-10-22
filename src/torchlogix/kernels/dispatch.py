@@ -103,7 +103,8 @@ def fold_ready(binarizer, conv, x) -> bool:
 
 def _fold_plan(layer, plan, raw_shape, jittered, thr):
     st = layer._lut
-    key = (plan["key"], tuple(raw_shape), bool(jittered), tuple(thr.shape))
+    key = (plan["key"], tuple(raw_shape), bool(jittered),
+           tuple(thr.shape[1:] if jittered else thr.shape))      # the batch size is not in the tables
     fp = st.fold_plan
     if fp is not None and fp["key"] == key:
         return fp
