@@ -7,7 +7,7 @@ alternatives and records the backend that ran in `layer._lut.ran` (+ `ran_train`
 import torch
 
 from . import lookup, ops, packed
-from .plan import (conv_leaf_table, dense_leaf_table, identity_table, pool_table)
+from .plan import (conv_leaf_table, dense_leaf_table, fold_tables, identity_table, pool_table)
 
 
 def fuses_pool(layer) -> bool:
@@ -27,6 +27,11 @@ def fuses_pool(layer) -> bool:
 
 def _plan(layer, device):
     st = layer._lut
+    if st.plan is not None and torch.compiler.is_compiling() and st.plan["key"][0] == str(device):
+        # H030 (1): under torch.compile the plan built eagerly (backend.prepare_plans) is
+        # used as is; the data_ptr / _version cache key below is not traceable (a graph
+        # break per layer). The wiring does not change during training.
+        return st.plan
     ref = layer.connections._indices_L0 if hasattr(layer.connections, "_indices_L0") \
         else layer.connections.indices
     key = (str(device), ref.data_ptr(), ref._version,
@@ -55,7 +60,10 @@ def _to_kernel_input(st, x):
     float32 / bfloat16."""
     x = x.reshape(x.shape[0], -1)
     if st.binary_input:
-        lookup.check_binary(st, x)
+        if not torch.compiler.is_compiling():
+            # (a host read; skipped inside a compiled region, where it is a graph break.
+            # The eager --correctness stage and the first eager call verify the front.)
+            lookup.check_binary(st, x)
         return x.to(torch.uint8).contiguous()
     if x.dtype not in (torch.float32, torch.bfloat16):
         x = x.float()
@@ -79,8 +87,68 @@ def _mark(layer, what, lang=None):
         st.lang = lang
 
 
+def fold_ready(binarizer, conv, x) -> bool:
+    """Whether `binarizer` (a FixedBinarization) hands its raw input and thresholds to `conv`
+    on this forward (H030 fold): a function of static state and the train/eval flag. Anything
+    else leaves the binarizer materialising the thermometer, as before."""
+    st = conv._lut
+    if st is None or not st.fold or st.backend != "fused" or conv.export_mode:
+        return False
+    if conv._forward_hooks or conv._forward_pre_hooks:        # hooks expect the bit tensor
+        return False
+    if not conv.training and st.eval_backend == "packed":     # packed eval keeps the bits
+        return False
+    return x.dtype == torch.float32
+
+
+def _fold_plan(layer, plan, raw_shape, jittered, thr):
+    st = layer._lut
+    key = (plan["key"], tuple(raw_shape), bool(jittered), tuple(thr.shape))
+    fp = st.fold_plan
+    if fp is not None and fp["key"] == key:
+        return fp
+    raw, tidx, tstride = fold_tables(st.fold_src, layer, tuple(raw_shape), jittered,
+                                     tuple(thr.shape))
+    leaf = plan["leaf"]                                       # (K, P, 2, S), on the device
+    dev = leaf.device
+    raw, tidx = raw.to(dev), tidx.to(dev)
+    fp = {"key": key, "leaf_r": raw[leaf.long()].to(torch.int32).contiguous(),
+          "leaf_t": tidx[leaf.long()].to(torch.int32).contiguous(), "tstride": tstride}
+    st.fold_plan = fp
+    return fp
+
+
+def _fold_conv_forward(layer, x, handed):
+    """The fused first conv on the RAW input: leaf bits are computed in the tree kernel."""
+    st = layer._lut
+    thr, jittered = handed
+    if thr.dtype != torch.float32:
+        raise TypeError(f"fold: thresholds must be fp32, got {thr.dtype}")
+    _mark(layer, "fused", ops.resolve_lang(x.device.type))
+    st.fold_ran = True
+    plan = _plan(layer, x.device)
+    fp = _fold_plan(layer, plan, x.shape[1:], jittered, thr)
+    xin = x.reshape(x.shape[0], -1)
+    if xin.dtype != torch.float32:
+        raise TypeError(f"fold: the raw input must be fp32, got {xin.dtype}")
+    xin = xin.contiguous()
+    w = torch.cat([s.reshape(-1) for s in lookup.sample_levels(layer)])
+    pooled = fuses_pool(layer)
+    pos, (hq, wq) = (plan["pool_pos"], plan["pool_hw"]) if pooled else \
+        (plan["id_pos"], plan["hw"])
+    y = ops.tree_fold(xin, fp["leaf_r"], fp["leaf_t"], thr.reshape(-1).contiguous(),
+                      fp["tstride"], pos, w, layer.tree_depth, _out_dtype(st))
+    return y.view(x.shape[0], layer.num_kernels, hq, wq)
+
+
 def conv_forward(layer, x):
     st = layer._lut
+    handed = layer._fold_thr
+    if handed is not None:                    # H030: the binarizer returned its raw input
+        layer._fold_thr = None                # consumed: never reused by a later forward
+        return _fold_conv_forward(layer, x, handed)
+    if st.fold_src is not None:
+        st.fold_ran = False                   # the binarizer materialised the bits this time
     if st.backend == "torch" and (layer.training or st.eval_backend != "packed"):
         _mark(layer, "torch")
         return layer._forward_torch(x)

@@ -31,12 +31,29 @@ def _level_w(w, depth, k, lvl, dtype):
     return blk.permute(1, 0, 2)                                    # (K, n, 4)
 
 
-def tree_roots(x, leaf, pos, w, depth, binary):
+def leaves_of(x, leaf, pos, fold=None):
+    """(idx, leaves): the gather indices (K, Q, WIN, 2, S) and the leaf values
+    (B, K, Q, WIN, 2, S) of every window position. With `fold = (leaf_t, thr, tstride)`
+    `x` is the RAW input and `leaf` the raw-element table (-1 = padding): the leaf is the bit
+    `x[raw] > thr[t]`, computed here (uint8), exactly the compare the materialised
+    thermometer does. `thr` is the flat threshold buffer; `tstride` > 0 means one threshold
+    row of that length per sample."""
+    posc = pos.long().clamp(min=0)
+    idx = leaf.long()[:, posc]
+    if fold is None:
+        return idx, x[:, idx]
+    leaf_t, thr, tstride = fold
+    it = leaf_t.long()[:, posc]
+    xv = x[:, idx.clamp(min=0)]
+    tv = thr.view(x.shape[0], -1)[:, it] if tstride else thr[it]
+    return idx, ((xv > tv) & (idx >= 0)).to(torch.uint8)
+
+
+def tree_roots(x, leaf, pos, w, depth, binary, fold=None):
     """(B, K, Q, WIN) roots (garbage where pos < 0), differentiable in x and w."""
     k, p, _, s0 = leaf.shape
     q, win = pos.shape
-    idx = leaf.long()[:, pos.long().clamp(min=0)]                  # (K, Q, WIN, 2, S)
-    leaves = x[:, idx]                                             # (B, K, Q, WIN, 2, S)
+    idx, leaves = leaves_of(x, leaf, pos, fold)                    # (B, K, Q, WIN, 2, S)
     a, b = leaves[..., 0, :], leaves[..., 1, :]
     w0 = _level_w(w, depth, k, 0, None)[None, :, None, None]       # (1, K, 1, 1, S, 4)
     if binary:
@@ -53,8 +70,8 @@ def tree_roots(x, leaf, pos, w, depth, binary):
     return out[..., 0]
 
 
-def forward(x, leaf, pos, w, depth, binary, out_dtype):
-    roots = tree_roots(x, leaf, pos, w, depth, binary)             # (B, K, Q, WIN)
+def forward(x, leaf, pos, w, depth, binary, out_dtype, fold=None):
+    roots = tree_roots(x, leaf, pos, w, depth, binary, fold)       # (B, K, Q, WIN)
     q, win = pos.shape
     if win == 1:
         return roots[..., 0].to(out_dtype), roots.new_zeros(0, dtype=torch.uint8)
@@ -64,11 +81,10 @@ def forward(x, leaf, pos, w, depth, binary, out_dtype):
     return y.to(out_dtype), arg.to(torch.uint8)
 
 
-def _levels(x, leaf, pos, w, depth, binary):
+def _levels(x, leaf, pos, w, depth, binary, fold=None):
     """Leaves and the output of every tree level: (idx, a0, b0, [out_0 .. out_{D-1}])."""
     k = leaf.shape[0]
-    idx = leaf.long()[:, pos.long().clamp(min=0)]                  # (K, Q, WIN, 2, S)
-    leaves = x[:, idx]
+    idx, leaves = leaves_of(x, leaf, pos, fold)
     a, b = leaves[..., 0, :], leaves[..., 1, :]
     w0 = _level_w(w, depth, k, 0, None)[None, :, None, None]
     if binary:
@@ -87,7 +103,7 @@ def _levels(x, leaf, pos, w, depth, binary):
     return idx, a, b, outs
 
 
-def backward(gy, x, leaf, pos, w, depth, binary, need_gx):
+def backward(gy, x, leaf, pos, w, depth, binary, need_gx, fold=None):
     """Hand-written backward with the kernels' algorithm: arg-max window slot only,
     interior recomputed, grad_W summed over samples / positions, grad_x scatter-added.
     Returns (gx (B, Nsrc) fp32 or None, gw like w). Runs without autograd (custom-op
@@ -95,7 +111,7 @@ def backward(gy, x, leaf, pos, w, depth, binary, need_gx):
     bsz, nsrc = x.shape
     k = leaf.shape[0]
     q, win = pos.shape
-    idx, a0, b0, outs = _levels(x, leaf, pos, w, depth, binary)
+    idx, a0, b0, outs = _levels(x, leaf, pos, w, depth, binary, fold)
     roots = outs[-1][..., 0]                                       # (B, K, Q, WIN)
     valid = (pos >= 0)[None, None]
     roots = torch.where(valid, roots, torch.full_like(roots, float("-inf")))
@@ -135,12 +151,13 @@ def backward(gy, x, leaf, pos, w, depth, binary, need_gx):
     return gx, gw
 
 
-def backward_autograd(gy, x, leaf, pos, w, depth, binary, need_gx):
+def backward_autograd(gy, x, leaf, pos, w, depth, binary, need_gx, fold=None):
     """Autograd of `forward`: the independent check of `backward` and of the kernels."""
     with torch.enable_grad():
         xx = x.detach().float().requires_grad_(need_gx and not binary)
         ww = w.detach().clone().requires_grad_(True)
-        y, _ = forward(xx if not binary else x, leaf, pos, ww, depth, binary, torch.float32)
+        y, _ = forward(xx if not binary else x, leaf, pos, ww, depth, binary, torch.float32,
+                       fold)
         ins = [ww] + ([xx] if need_gx and not binary else [])
         g = torch.autograd.grad(y, ins, gy.float())
     return (g[1] if len(g) > 1 else None), g[0]

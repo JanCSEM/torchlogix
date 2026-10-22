@@ -85,3 +85,43 @@ def level_offsets(depth: int, k: int):
         offs.append(o)
         o += (s0 >> lvl) * k * 4
     return offs, o
+
+
+def fold_tables(binarizer, layer, raw_shape, jittered: bool, thr_shape):
+    """H030 fold: the leaf -> (raw input element, threshold element) tables.
+
+    The conv's leaf table indexes one sample of the PADDED, MERGED thermometer tensor
+    (what `FixedBinarization.forward` + `merge_dim_with_last` + `layer._pad` produce). Here
+    the binarizer's own forward is replayed on index tensors, so the layout, the merge and
+    the padding are by construction the module's own: element j of the padded merged
+    tensor is the bit `x[raw_flat[j]] > thr[thr_flat[j]]`, and `raw_flat[j] == -1` marks
+    padding (bit 0). Zero-padding the raw input instead would be wrong (`0 > t` is 1 for a
+    negative t), hence the +1 / pad-with-0 / -1 trick on the index tensor.
+
+    `raw_shape`: the binarizer's input without the batch axis. `thr_shape`: the shape of the
+    thresholds it computed, (C, L) or (L,) etc.; with `jittered` a leading batch axis (B, ...)
+    that the kernel addresses with a per-sample stride.
+
+    Returns (raw_flat, thr_flat) int64 of length channels * Hp * Wp, plus the per-sample
+    threshold stride (0 when the thresholds are shared by the batch).
+    """
+    from ..layers.binarization import merge_dim_with_last
+    n_lvl = thr_shape[-1]
+    n_raw = math.prod(raw_shape)
+    ridx = torch.arange(n_raw, dtype=torch.int64).view(1, *raw_shape) + 1      # 0 = padding
+    xu = ridx.unsqueeze(-1)                                                      # as in forward
+    full = (*ridx.shape, n_lvl)
+    raw = xu.expand(full).contiguous()
+    t_unb = tuple(thr_shape[1:]) if jittered else tuple(thr_shape)
+    tb = torch.arange(math.prod(t_unb), dtype=torch.int64).view(t_unb)
+    tb = binarizer._broadcast_thresholds(tb.unsqueeze(0) if jittered else tb, xu,
+                                         batched=jittered)
+    thr = tb.expand(full).contiguous()
+    merged_r = merge_dim_with_last(raw, binarizer.feature_dim)
+    merged_t = merge_dim_with_last(thr, binarizer.feature_dim)
+    pad_r, pad_t = layer._pad(merged_r), layer._pad(merged_t)
+    want = (1, layer.channels, *[d + 2 * p for d, p in zip(layer.in_dim, layer.padding)])
+    if tuple(pad_r.shape) != want:
+        raise ValueError(f"fold: the binarizer output {tuple(pad_r.shape)} does not match the "
+                         f"first conv's input {want}")
+    return pad_r.reshape(-1) - 1, pad_t.reshape(-1), (math.prod(t_unb) if jittered else 0)

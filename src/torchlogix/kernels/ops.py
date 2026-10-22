@@ -115,3 +115,79 @@ def tree(x: torch.Tensor, leaf, pos, w, depth: int, binary: bool, out_bf16: bool
     need_arg = bool(torch.is_grad_enabled() and (w.requires_grad or x.requires_grad))
     y, _ = tree_fwd(x, leaf, pos, w, depth, binary, out_bf16, need_arg)
     return y
+
+
+# ----------------------------------------------------------------------------------
+# H030 fold: the first logic layer reads the RAW fp32 input and computes its leaf bits
+# (x[raw] > thr[t]) inside the tree kernel; no thermometer tensor is materialised.
+#
+#   tree_fold_fwd(x, leaf_r, leaf_t, thr, tstride, pos, w, depth, out_bf16, need_arg) -> (y, arg)
+#   tree_fold_bwd(gy, x, leaf_r, leaf_t, thr, tstride, pos, arg, w, depth)            -> gw
+#
+# Only grad_W exists (the leaves are comparisons: no gradient reaches x, exactly as with
+# the materialised thermometer). Same implementation choice as `tree_fwd`.
+# ----------------------------------------------------------------------------------
+
+@torch.library.custom_op("torchlogix::tree_fold_fwd", mutates_args=())
+def tree_fold_fwd(x: torch.Tensor, leaf_r: torch.Tensor, leaf_t: torch.Tensor, thr: torch.Tensor,
+                  tstride: int, pos: torch.Tensor, w: torch.Tensor, depth: int, out_bf16: bool,
+                  need_arg: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    out_dtype = torch.bfloat16 if out_bf16 else torch.float32
+    impl = _impl(resolve_lang(x.device.type))
+    fold = (leaf_t, thr, tstride)
+    if impl is None:
+        y, arg = reference.forward(x, leaf_r, pos, w, depth, True, out_dtype, fold)
+        if not need_arg or pos.shape[1] == 1:
+            arg = arg.new_empty(0)
+        return y.contiguous(), arg.contiguous()
+    return impl.fwd(x, leaf_r, pos, w, depth, True, out_dtype, need_arg, fold)
+
+
+@tree_fold_fwd.register_fake
+def _(x, leaf_r, leaf_t, thr, tstride, pos, w, depth, out_bf16, need_arg):
+    b, k, (q, win) = x.shape[0], leaf_r.shape[0], pos.shape
+    y = x.new_empty((b, k, q), dtype=torch.bfloat16 if out_bf16 else torch.float32)
+    arg = x.new_empty((b, k, q) if (need_arg and win > 1) else (0,), dtype=torch.uint8)
+    return y, arg
+
+
+@torch.library.custom_op("torchlogix::tree_fold_bwd", mutates_args=())
+def tree_fold_bwd(gy: torch.Tensor, x: torch.Tensor, leaf_r: torch.Tensor, leaf_t: torch.Tensor,
+                  thr: torch.Tensor, tstride: int, pos: torch.Tensor, arg: torch.Tensor,
+                  w: torch.Tensor, depth: int) -> torch.Tensor:
+    impl = _impl(resolve_lang(x.device.type))
+    fold = (leaf_t, thr, tstride)
+    if impl is None:
+        _, gw = reference.backward(gy, x, leaf_r, pos, w, depth, True, False, fold)
+    else:
+        _, gw = impl.bwd(gy, x, leaf_r, pos, arg, w, depth, True, False, fold)
+    return gw
+
+
+@tree_fold_bwd.register_fake
+def _(gy, x, leaf_r, leaf_t, thr, tstride, pos, arg, w, depth):
+    return torch.empty_like(w)
+
+
+def _fold_setup(ctx, inputs, output):
+    x, leaf_r, leaf_t, thr, tstride, pos, w, depth, out_bf16, need_arg = inputs
+    _, arg = output
+    ctx.save_for_backward(x, leaf_r, leaf_t, thr, pos, arg, w)
+    ctx.depth, ctx.tstride = depth, tstride
+
+
+def _fold_backward(ctx, gy, _garg):
+    x, leaf_r, leaf_t, thr, pos, arg, w = ctx.saved_tensors
+    gw = tree_fold_bwd(gy, x, leaf_r, leaf_t, thr, ctx.tstride, pos, arg, w, ctx.depth)
+    return None, None, None, None, None, None, gw, None, None, None
+
+
+tree_fold_fwd.register_autograd(_fold_backward, setup_context=_fold_setup)
+
+
+def tree_fold(x, leaf_r, leaf_t, thr, tstride: int, pos, w, depth: int,
+              out_bf16: bool) -> torch.Tensor:
+    """Run the folded first-layer tree op; returns y (B, K, Q)."""
+    need_arg = bool(torch.is_grad_enabled() and w.requires_grad)
+    y, _ = tree_fold_fwd(x, leaf_r, leaf_t, thr, tstride, pos, w, depth, out_bf16, need_arg)
+    return y

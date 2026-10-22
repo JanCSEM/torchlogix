@@ -40,6 +40,7 @@ class _LogicConvNd(LogicBase):
         connections_kwargs (dict): Additional keyword arguments for connections."""
 
     _lut = None     # H027: backend state, set by torchlogix.backend.set_backend
+    _fold_thr = None    # H030: (thresholds, jittered) handed by the FixedBinarization in front
 
     def __init__(
         self,

@@ -51,26 +51,44 @@ def _pair_level(out, w_ptr, k, K, lvl: tl.constexpr, S0: tl.constexpr, BLOCK: tl
 
 
 @triton.jit
-def _load_leaves(x_ptr, leaf_ptr, b, k, p, ok, P, Nsrc, S0: tl.constexpr, BINARY: tl.constexpr):
+def _load_leaves(x_ptr, leaf_ptr, leaf_t_ptr, thr_ptr, tstride, b, k, p, ok, P, Nsrc,
+                 S0: tl.constexpr, BINARY: tl.constexpr, FOLD: tl.constexpr):
     f = tl.arange(0, S0)
     lbase = leaf_ptr + ((k * P + p) * 2) * S0
     m = ok[:, None]
     la = tl.load(lbase[:, None] + f[None, :], mask=m, other=0)
     lb = tl.load(lbase[:, None] + S0 + f[None, :], mask=m, other=0)
     xb = x_ptr + b.to(tl.int64)[:, None] * Nsrc
-    a = tl.load(xb + la, mask=m, other=0)
-    c = tl.load(xb + lb, mask=m, other=0)
-    if not BINARY:
-        a = a.to(tl.float32)
-        c = c.to(tl.float32)
+    if FOLD:
+        # H030 fold: x is the RAW fp32 input; the leaf is the bit  x[raw] > thr[t]  (la = raw
+        # element, -1 = padding -> bit 0), the compare the materialised thermometer does.
+        tbase = leaf_t_ptr + ((k * P + p) * 2) * S0
+        ta = tl.load(tbase[:, None] + f[None, :], mask=m, other=0)
+        tb = tl.load(tbase[:, None] + S0 + f[None, :], mask=m, other=0)
+        trow = thr_ptr + b.to(tl.int64)[:, None] * tstride
+        oka = m & (la >= 0)
+        okb = m & (lb >= 0)
+        xa = tl.load(xb + la, mask=oka, other=0.0)
+        xc = tl.load(xb + lb, mask=okb, other=0.0)
+        ha = tl.load(trow + ta, mask=oka, other=0.0)
+        hc = tl.load(trow + tb, mask=okb, other=0.0)
+        a = ((xa > ha) & oka).to(tl.uint8)
+        c = ((xc > hc) & okb).to(tl.uint8)
+    else:
+        a = tl.load(xb + la, mask=m, other=0)
+        c = tl.load(xb + lb, mask=m, other=0)
+        if not BINARY:
+            a = a.to(tl.float32)
+            c = c.to(tl.float32)
     return a, c, la, lb
 
 
 @triton.jit
-def _tree_root(x_ptr, leaf_ptr, w_ptr, b, k, p, ok, K, P, Nsrc,
-               D: tl.constexpr, BINARY: tl.constexpr, BLOCK: tl.constexpr):
+def _tree_root(x_ptr, leaf_ptr, leaf_t_ptr, thr_ptr, tstride, w_ptr, b, k, p, ok, K, P, Nsrc,
+               D: tl.constexpr, BINARY: tl.constexpr, FOLD: tl.constexpr, BLOCK: tl.constexpr):
     S0: tl.constexpr = 1 << (D - 1)
-    a, c, la, lb = _load_leaves(x_ptr, leaf_ptr, b, k, p, ok, P, Nsrc, S0, BINARY)
+    a, c, la, lb = _load_leaves(x_ptr, leaf_ptr, leaf_t_ptr, thr_ptr, tstride, b, k, p, ok, P,
+                                Nsrc, S0, BINARY, FOLD)
     out = _level0(a, c, w_ptr, k, K, S0, BINARY)
     for lvl in tl.static_range(1, D):
         out = _pair_level(out, w_ptr, k, K, lvl, S0, BLOCK)
@@ -79,8 +97,10 @@ def _tree_root(x_ptr, leaf_ptr, w_ptr, b, k, p, ok, K, P, Nsrc,
 
 @triton.jit
 def _fwd_kernel(x_ptr, leaf_ptr, pos_ptr, w_ptr, y_ptr, arg_ptr, B, K, P, Q, Nsrc,
+                leaf_t_ptr, thr_ptr, tstride,
                 D: tl.constexpr, WIN: tl.constexpr, BINARY: tl.constexpr,
-                OUT_BF16: tl.constexpr, STORE_ARG: tl.constexpr, BLOCK: tl.constexpr):
+                OUT_BF16: tl.constexpr, STORE_ARG: tl.constexpr, FOLD: tl.constexpr,
+                BLOCK: tl.constexpr):
     k = tl.program_id(0)
     i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     valid = i < B * Q
@@ -91,7 +111,8 @@ def _fwd_kernel(x_ptr, leaf_ptr, pos_ptr, w_ptr, y_ptr, arg_ptr, B, K, P, Q, Nsr
     for j in tl.static_range(WIN):
         p = tl.load(pos_ptr + q * WIN + j, mask=valid, other=-1)
         ok = valid & (p >= 0)
-        root = _tree_root(x_ptr, leaf_ptr, w_ptr, b, k, p, ok, K, P, Nsrc, D, BINARY, BLOCK)
+        root = _tree_root(x_ptr, leaf_ptr, leaf_t_ptr, thr_ptr, tstride, w_ptr, b, k, p, ok, K,
+                          P, Nsrc, D, BINARY, FOLD, BLOCK)
         # same rule as max_pool2d: first max on ties, a NaN always replaces (propagates)
         upd = ok & ((root > best) | (root != root))
         best = tl.where(upd, root, best)
@@ -119,9 +140,9 @@ def _inputs_at(a0, c0, w_ptr, k, K, lvl: tl.constexpr, S0: tl.constexpr,
 
 @triton.jit
 def _bwd_kernel(gy_ptr, x_ptr, leaf_ptr, pos_ptr, arg_ptr, w_ptr, gx_ptr, gw_ptr,
-                B, K, P, Q, Nsrc,
+                B, K, P, Q, Nsrc, leaf_t_ptr, thr_ptr, tstride,
                 D: tl.constexpr, WIN: tl.constexpr, BINARY: tl.constexpr,
-                NEED_GX: tl.constexpr, BLOCK: tl.constexpr):
+                NEED_GX: tl.constexpr, FOLD: tl.constexpr, BLOCK: tl.constexpr):
     S0: tl.constexpr = 1 << (D - 1)
     k = tl.program_id(0)
     i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -136,7 +157,8 @@ def _bwd_kernel(gy_ptr, x_ptr, leaf_ptr, pos_ptr, arg_ptr, w_ptr, gx_ptr, gw_ptr
     p = tl.load(pos_ptr + q * WIN + j, mask=valid, other=-1)
     ok = valid & (p >= 0)
     g = tl.load(gy_ptr + o, mask=ok, other=0.0).to(tl.float32)[:, None]      # [BLOCK, 1]
-    a0, c0, la, lb = _load_leaves(x_ptr, leaf_ptr, b, k, p, ok, P, Nsrc, S0, BINARY)
+    a0, c0, la, lb = _load_leaves(x_ptr, leaf_ptr, leaf_t_ptr, thr_ptr, tstride, b, k, p, ok, P,
+                                  Nsrc, S0, BINARY, FOLD)
     for lvl in tl.static_range(D - 1, -1, -1):
         off = (2 * S0 - 2 * (S0 >> lvl)) * K * 4
         nn = tl.arange(0, (S0 >> lvl))
@@ -196,7 +218,9 @@ def _grid(k, items, block):
     return g
 
 
-def fwd(x, leaf, pos, w, depth, binary, out_dtype, need_arg):
+def fwd(x, leaf, pos, w, depth, binary, out_dtype, need_arg, fold=None):
+    """`fold = (leaf_t, thr, tstride)`: x is the raw fp32 input and the leaves are computed
+    in-kernel (see `_load_leaves`); None = the leaves are read from `x` as before."""
     b, nsrc = x.shape
     k, p = leaf.shape[0], leaf.shape[1]
     q, win = pos.shape
@@ -206,13 +230,15 @@ def fwd(x, leaf, pos, w, depth, binary, out_dtype, need_arg):
         torch.empty(0, dtype=torch.uint8, device=x.device)
     block = _block(depth)
     grid = _grid(k, b * q, block)
-    _fwd_kernel[grid](x, leaf, pos, w, y, arg, b, k, p, q, nsrc,
+    lt, thr, ts = fold if fold is not None else (None, None, 0)
+    _fwd_kernel[grid](x, leaf, pos, w, y, arg, b, k, p, q, nsrc, lt, thr, ts,
                       D=depth, WIN=win, BINARY=binary, OUT_BF16=(out_dtype == torch.bfloat16),
-                      STORE_ARG=store_arg, BLOCK=block, enable_fp_fusion=False)
+                      STORE_ARG=store_arg, FOLD=fold is not None, BLOCK=block,
+                      enable_fp_fusion=False)
     return y, arg
 
 
-def bwd(gy, x, leaf, pos, arg, w, depth, binary, need_gx):
+def bwd(gy, x, leaf, pos, arg, w, depth, binary, need_gx, fold=None):
     b, nsrc = x.shape
     k, p = leaf.shape[0], leaf.shape[1]
     q, win = pos.shape
@@ -221,7 +247,36 @@ def bwd(gy, x, leaf, pos, arg, w, depth, binary, need_gx):
         torch.empty(0, dtype=torch.float32, device=x.device)
     block = _block(depth)
     grid = _grid(k, b * q, block)
+    lt, thr, ts = fold if fold is not None else (None, None, 0)
     _bwd_kernel[grid](gy.contiguous(), x, leaf, pos, arg, w, gx, gw, b, k, p, q, nsrc,
+                      lt, thr, ts,
                       D=depth, WIN=win, BINARY=binary, NEED_GX=need_gx and not binary,
-                      BLOCK=block, enable_fp_fusion=False)
+                      FOLD=fold is not None, BLOCK=block, enable_fp_fusion=False)
     return (gx if need_gx and not binary else None), gw
+
+
+@triton.jit
+def _fold_bits_kernel(x_ptr, leaf_ptr, leaf_t_ptr, thr_ptr, out_ptr, K, P, Nsrc, tstride,
+                      S0: tl.constexpr, BLOCK: tl.constexpr):
+    k = tl.program_id(0)
+    b = tl.program_id(1)
+    p = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    ok = p < P
+    bv = tl.zeros([BLOCK], dtype=tl.int32) + b
+    a, c, la, lb = _load_leaves(x_ptr, leaf_ptr, leaf_t_ptr, thr_ptr, tstride, bv, k, p, ok,
+                                P, Nsrc, S0, True, True)
+    f = tl.arange(0, S0)
+    o = (((b.to(tl.int64) * K + k) * P + p) * 2 * S0)[:, None] + f[None, :]
+    tl.store(out_ptr + o, a, mask=ok[:, None])
+    tl.store(out_ptr + o + S0, c, mask=ok[:, None])
+
+
+def fold_leaf_bits(x, leaf_r, leaf_t, thr, tstride):
+    """Debug output of the fold (G4): the in-kernel leaf bits, uint8 (B, K, P, 2, S0)."""
+    b, nsrc = x.shape
+    k, p, _, s0 = leaf_r.shape
+    out = torch.empty(b, k, p, 2, s0, dtype=torch.uint8, device=x.device)
+    block = 64
+    _fold_bits_kernel[(k, b, triton.cdiv(p, block))](
+        x, leaf_r, leaf_t, thr, out, k, p, nsrc, tstride, S0=s0, BLOCK=block)
+    return out

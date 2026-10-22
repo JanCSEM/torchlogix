@@ -311,20 +311,37 @@ class FixedBinarization(Binarization):
     def __init__(self, thresholds: Tensor, feature_dim=-2, **kwargs):
         super().__init__(thresholds, feature_dim, **kwargs)
     
+    # H030 fold (set by torchlogix.backend.set_backend): the first fused logic conv that
+    # takes this module's output. Plain attribute (not a child module: no state_dict entry,
+    # no double registration).
+    _fold_target = None
+
     def forward(self, x: Tensor) -> Tensor:
         if self.thresholds is None:
             raise ValueError('Need to fit before calling apply')
         batch = x.shape[0]
+        raw_in = x
         x = x.unsqueeze(-1)
 
         # `indep` is a post-comparison flip, not a threshold transform, so it takes
         # the raw grid and its own branch.
         if self.training and self.thresh_jitter > 0.0 and self.thresh_jitter_mode == "indep":
+            if self._fold_target is not None:
+                self._fold_target._fold_thr = None
             raw = self._broadcast_thresholds(self._raw_thresholds(), x, batched=False)
             return merge_dim_with_last(self._apply_indep_flip(x, raw), self.feature_dim)
 
-        t = self.get_thresholds(batch_size=batch)
+        t = self.get_thresholds(batch_size=batch)    # the jitter draws happen here, as always
         jittered = t.dim() > self._raw_thresholds().dim()
+        tgt = self._fold_target
+        if tgt is not None:
+            from ..kernels.dispatch import fold_ready
+            if fold_ready(self, tgt, raw_in):
+                # fold: hand the raw input and the thresholds to the conv, which computes
+                # the leaf bits `x > t` inside its tree kernel; the bit tensor is never built
+                tgt._fold_thr = (t, jittered)
+                return raw_in
+            tgt._fold_thr = None
         t = self._broadcast_thresholds(t, x, batched=jittered)
         x = (x > t).float()
         return merge_dim_with_last(x, self.feature_dim)
