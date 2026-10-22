@@ -25,7 +25,11 @@ def fuses_pool(layer) -> bool:
     return st.backend == "fused" or (st.backend == "lookup" and st.bf16 and not st.head)
 
 
+@torch.compiler.disable
 def _plan(layer, device):
+    # static tables built eagerly on first use: dynamo must not trace the CPU table
+    # construction (job 5123806: Inductor tried to compile it for the CPU), so this is a
+    # deliberate, single graph break per layer
     st = layer._lut
     if st.plan is not None and torch.compiler.is_compiling() and st.plan["key"][0] == str(device):
         # H030 (1): under torch.compile the plan built eagerly (backend.prepare_plans) is
