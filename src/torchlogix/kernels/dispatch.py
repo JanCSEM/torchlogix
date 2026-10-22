@@ -25,17 +25,23 @@ def fuses_pool(layer) -> bool:
     return st.backend == "fused" or (st.backend == "lookup" and st.bf16 and not st.head)
 
 
+def _get_plan(layer, device):
+    """H030 (1): the traceable accessor. Inside a compiled region the plan that
+    `backend.prepare_plans` built eagerly is returned as is (no graph break); the builder
+    `_plan` is dynamo-opaque (it is `torch.compiler.disable`d, a graph break per layer) and
+    is called when no plan for this device exists yet or outside compilation."""
+    st = layer._lut
+    if st.plan is not None and torch.compiler.is_compiling() and st.plan["key"][0] == str(device):
+        return st.plan
+    return _plan(layer, device)
+
+
 @torch.compiler.disable
 def _plan(layer, device):
     # static tables built eagerly on first use: dynamo must not trace the CPU table
     # construction (job 5123806: Inductor tried to compile it for the CPU), so this is a
     # deliberate, single graph break per layer
     st = layer._lut
-    if st.plan is not None and torch.compiler.is_compiling() and st.plan["key"][0] == str(device):
-        # H030 (1): under torch.compile the plan built eagerly (backend.prepare_plans) is
-        # used as is; the data_ptr / _version cache key below is not traceable (a graph
-        # break per layer). The wiring does not change during training.
-        return st.plan
     ref = layer.connections._indices_L0 if hasattr(layer.connections, "_indices_L0") \
         else layer.connections.indices
     key = (str(device), ref.data_ptr(), ref._version,
@@ -112,6 +118,15 @@ def _fold_plan(layer, plan, raw_shape, jittered, thr):
     fp = st.fold_plan
     if fp is not None and fp["key"] == key:
         return fp
+    return _build_fold_plan(layer, plan, raw_shape, jittered, thr, key)
+
+
+@torch.compiler.disable
+def _build_fold_plan(layer, plan, raw_shape, jittered, thr, key):
+    """The (raw element, threshold element) tables of the fold; built eagerly on first use
+    (dynamo-opaque like `_plan`: a compiled model is warmed up eagerly first, see
+    `dlgn.train.bench.warm_eager`)."""
+    st = layer._lut
     raw, tidx, tstride = fold_tables(st.fold_src, layer, tuple(raw_shape), jittered,
                                      tuple(thr.shape))
     leaf = plan["leaf"]                                       # (K, P, 2, S), on the device
@@ -131,7 +146,7 @@ def _fold_conv_forward(layer, x, handed):
         raise TypeError(f"fold: thresholds must be fp32, got {thr.dtype}")
     _mark(layer, "fused", ops.resolve_lang(x.device.type))
     st.fold_ran = True
-    plan = _plan(layer, x.device)
+    plan = _get_plan(layer, x.device)
     fp = _fold_plan(layer, plan, x.shape[1:], jittered, thr)
     xin = x.reshape(x.shape[0], -1)
     if xin.dtype != torch.float32:
@@ -172,7 +187,7 @@ def conv_forward(layer, x):
         return out.to(torch.bfloat16) if _out_dtype(st) else out
     # fused
     _mark(layer, "fused", ops.resolve_lang(x.device.type))
-    plan = _plan(layer, x.device)
+    plan = _get_plan(layer, x.device)
     xin = _to_kernel_input(st, layer._pad(x))
     w = torch.cat([s.reshape(-1) for s in lookup.sample_levels(layer)])
     pooled = fuses_pool(layer)
@@ -200,7 +215,7 @@ def dense_forward(layer, x):
         x = GradFactor.apply(x, layer.grad_factor)
     lead = x.shape[:-1]
     x = x.reshape(-1, layer.in_dim)
-    plan = _plan(layer, x.device)
+    plan = _get_plan(layer, x.device)
     xin = _to_kernel_input(st, x)
     w = lookup.sample_levels_dense(layer).reshape(-1)
     y = ops.tree(xin, plan["leaf"], plan["id_pos"], w, 1, st.binary_input, _out_dtype(st))
