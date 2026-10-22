@@ -206,7 +206,7 @@ def set_backend(model, lut_backend="torch", lut_compile=False, eval_backend="tor
                 object.__setattr__(pool, "_absorbed_by", conv)
     for b in (m for m in model.modules() if isinstance(m, FixedBinarization)):
         object.__setattr__(b, "_fold_target", None)       # re-setting a backend resets folds
-    if fold_requested(fold) and lut_backend == "fused":
+    if fold_requested(fold) and lut_backend == "fused" and not hasattr(model, "forward_all"):
         pairs, notes = _pair_folds(model)
         for b, conv in pairs:
             object.__setattr__(b, "_fold_target", conv)
@@ -216,7 +216,9 @@ def set_backend(model, lut_backend="torch", lut_compile=False, eval_backend="tor
                 m._lut.fold_note = notes[id(m)]
     elif fold_requested(fold):
         for m in layers[:1]:
-            m._lut.fold_note = f"not applied: lut_backend={lut_backend!r} (fold needs fused)"
+            m._lut.fold_note = (f"not applied: lut_backend={lut_backend!r} (fold needs fused)"
+                                if lut_backend != "fused" else
+                                "not applied: early-exit model (taps intermediate activations)")
     return backend_report(model)
 
 
