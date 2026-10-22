@@ -4,10 +4,9 @@
     tree_fwd(x, leaf, pos, w, depth, binary, out_bf16, need_arg) -> (y, arg)
     tree_bwd(gy, x, leaf, pos, arg, w, depth, binary, need_gx)   -> (gx, gw)
 
-Implementation choice per call: CUDA tensors -> `FUSED_LANG` ("triton" | "cuda" | "auto";
-auto = Triton when importable, else CUDA C++); CPU tensors -> `CPU_IMPL` ("reference" =
-pure PyTorch, "triton" = the Triton CPU interpreter, TRITON_INTERPRET=1, "cuda_emu" is
-test-only and installed by the tests).
+Implementation choice per call: CUDA tensors -> Triton (`FUSED_LANG` "triton" | "auto"; the
+CUDA C++ candidate lost the H027 bake-off and was removed); CPU tensors -> `CPU_IMPL`
+("reference" = pure PyTorch, "triton" = the Triton CPU interpreter, TRITON_INTERPRET=1).
 """
 
 import os
@@ -19,7 +18,6 @@ from . import reference
 
 FUSED_LANG = os.environ.get("TORCHLOGIX_FUSED_LANG", "auto")
 CPU_IMPL = "reference"
-_CPU_EMU = None          # tests: module with fwd/bwd emulating the CUDA kernels on CPU
 
 
 def triton_available() -> bool:
@@ -31,21 +29,16 @@ def triton_available() -> bool:
 
 
 def resolve_lang(device_type: str) -> str:
-    """The implementation a call on `device_type` uses. An explicitly requested language
-    that is unavailable RAISES (no silent fallback); "auto" picks Triton when importable,
-    else CUDA C++, and the pick is recorded by the callers (`LutState.lang`)."""
+    """The implementation a call on `device_type` uses. Triton is the only GPU kernel
+    language; it raises when it cannot be imported (no silent fallback). The pick is
+    recorded by the callers (`LutState.lang`)."""
     if device_type == "cuda":
-        if FUSED_LANG not in ("auto", "triton", "cuda"):
-            raise ValueError(f"FUSED_LANG / TORCHLOGIX_FUSED_LANG must be auto|triton|cuda, "
+        if FUSED_LANG not in ("auto", "triton"):
+            raise ValueError(f"FUSED_LANG / TORCHLOGIX_FUSED_LANG must be auto|triton, "
                              f"got {FUSED_LANG!r}")
-        if FUSED_LANG == "triton":
-            if not triton_available():
-                raise RuntimeError("kernel language 'triton' was requested but triton is "
-                                   "not importable")
-            return "triton"
-        if FUSED_LANG == "cuda":
-            return "cuda"             # a build failure (nvcc, ninja) raises in cuda_tree
-        return "triton" if triton_available() else "cuda"
+        if not triton_available():
+            raise RuntimeError("the fused backend on CUDA needs triton, which is not importable")
+        return "triton"
     return CPU_IMPL
 
 
@@ -53,11 +46,6 @@ def _impl(lang):
     if lang == "triton":
         from . import triton_tree
         return triton_tree
-    if lang == "cuda":
-        from . import cuda_tree
-        return cuda_tree
-    if lang == "cuda_emu":
-        return _CPU_EMU
     return None
 
 
