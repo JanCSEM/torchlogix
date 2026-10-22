@@ -138,7 +138,7 @@ def _bwd_kernel(gy_ptr, x_ptr, leaf_ptr, pos_ptr, arg_ptr, w_ptr, gx_ptr, gw_ptr
     g = tl.load(gy_ptr + o, mask=ok, other=0.0).to(tl.float32)[:, None]      # [BLOCK, 1]
     a0, c0, la, lb = _load_leaves(x_ptr, leaf_ptr, b, k, p, ok, P, Nsrc, S0, BINARY)
     for lvl in tl.static_range(D - 1, -1, -1):
-        n: tl.constexpr = S0 >> lvl
+        n = S0 >> lvl
         off = (2 * S0 - 2 * n) * K * 4
         nn = tl.arange(0, n)
         gp = gw_ptr + off + (nn * K + k) * 4
