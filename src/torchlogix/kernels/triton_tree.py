@@ -138,9 +138,8 @@ def _bwd_kernel(gy_ptr, x_ptr, leaf_ptr, pos_ptr, arg_ptr, w_ptr, gx_ptr, gw_ptr
     g = tl.load(gy_ptr + o, mask=ok, other=0.0).to(tl.float32)[:, None]      # [BLOCK, 1]
     a0, c0, la, lb = _load_leaves(x_ptr, leaf_ptr, b, k, p, ok, P, Nsrc, S0, BINARY)
     for lvl in tl.static_range(D - 1, -1, -1):
-        n = S0 >> lvl
-        off = (2 * S0 - 2 * n) * K * 4
-        nn = tl.arange(0, n)
+        off = (2 * S0 - 2 * (S0 >> lvl)) * K * 4
+        nn = tl.arange(0, (S0 >> lvl))
         gp = gw_ptr + off + (nn * K + k) * 4
         if lvl == 0:
             if BINARY:
@@ -148,8 +147,8 @@ def _bwd_kernel(gy_ptr, x_ptr, leaf_ptr, pos_ptr, arg_ptr, w_ptr, gx_ptr, gw_ptr
                 pb = c0 != 0
                 na = a0 == 0
                 nb = c0 == 0
-                gz = g + tl.zeros([BLOCK, n], dtype=tl.float32)
-                zero = tl.zeros([BLOCK, n], dtype=tl.float32)
+                gz = g + tl.zeros([BLOCK, (S0 >> lvl)], dtype=tl.float32)
+                zero = tl.zeros([BLOCK, (S0 >> lvl)], dtype=tl.float32)
                 tl.atomic_add(gp + 0, tl.sum(tl.where(na & nb, gz, zero), axis=0))
                 tl.atomic_add(gp + 1, tl.sum(tl.where(na & pb, gz, zero), axis=0))
                 tl.atomic_add(gp + 2, tl.sum(tl.where(pa & nb, gz, zero), axis=0))
@@ -183,7 +182,7 @@ def _bwd_kernel(gy_ptr, x_ptr, leaf_ptr, pos_ptr, arg_ptr, w_ptr, gx_ptr, gw_ptr
             tl.atomic_add(gp + 3, tl.sum(g * (a * c), axis=0))
             ga = g * ((w2 - w0) * (1.0 - c) + (w3 - w1) * c)
             gb = g * ((w1 - w0) * (1.0 - a) + (w3 - w2) * a)
-            g = tl.reshape(tl.join(ga, gb), [BLOCK, 2 * n])
+            g = tl.reshape(tl.join(ga, gb), [BLOCK, 2 * (S0 >> lvl)])
 
 
 def _block(depth: int) -> int:
