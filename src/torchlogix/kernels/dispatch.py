@@ -108,6 +108,8 @@ def fold_ready(binarizer, conv, x) -> bool:
         return False
     if not conv.training and st.eval_backend == "packed":     # packed eval keeps the bits
         return False
+    if binarizer._forward_hooks or binarizer._forward_pre_hooks:   # hooks expect the bits too
+        return False
     return x.dtype == torch.float32
 
 

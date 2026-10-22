@@ -116,6 +116,27 @@ def _binary_first(model):
     return None
 
 
+def _arm_pre(mod, args):
+    for b in mod._fold_bins:
+        object.__setattr__(b, "_fold_armed", True)
+
+
+def _arm_post(mod, args, out):
+    for b in mod._fold_bins:
+        object.__setattr__(b, "_fold_armed", False)
+
+
+def _arm_with(seq, binarizer):
+    """The binarizer folds only while its Sequential is running (internal forward hooks that
+    arm / disarm it): a standalone `binarizer(x)` call returns the bits, never the raw input.
+    Module-level functions + a plain list attribute, so a deepcopy of the model stays correct."""
+    if getattr(seq, "_fold_bins", None) is None:
+        object.__setattr__(seq, "_fold_bins", [])
+        seq.register_forward_pre_hook(_arm_pre)
+        seq.register_forward_hook(_arm_post)
+    seq._fold_bins.append(binarizer)
+
+
 def _pair_folds(model):
     """(binarizer, conv) pairs for the H030 fold: a FixedBinarization directly followed by
     the first logic conv (a binary-input LogicConv2d) in one Sequential. Returns
@@ -131,6 +152,7 @@ def _pair_folds(model):
                         continue                         # a post-compare flip: no fold
                     pairs.append((a, b))
                     paired.add(id(b))
+                    _arm_with(mod, a)
     notes = {}
     for m in logic_layers(model)[:1]:                    # the first logic layer is the candidate
         if id(m) not in paired:
@@ -206,6 +228,9 @@ def set_backend(model, lut_backend="torch", lut_compile=False, eval_backend="tor
                 object.__setattr__(pool, "_absorbed_by", conv)
     for b in (m for m in model.modules() if isinstance(m, FixedBinarization)):
         object.__setattr__(b, "_fold_target", None)       # re-setting a backend resets folds
+        object.__setattr__(b, "_fold_armed", False)
+    for q in (m for m in model.modules() if getattr(m, "_fold_bins", None) is not None):
+        object.__setattr__(q, "_fold_bins", [])           # (the arming hooks then do nothing)
     if fold_requested(fold) and lut_backend == "fused" and not hasattr(model, "forward_all"):
         pairs, notes = _pair_folds(model)
         for b, conv in pairs:

@@ -315,6 +315,7 @@ class FixedBinarization(Binarization):
     # takes this module's output. Plain attribute (not a child module: no state_dict entry,
     # no double registration).
     _fold_target = None
+    _fold_armed = False   # True only while the paired Sequential runs (backend._arm_with)
 
     def forward(self, x: Tensor) -> Tensor:
         if self.thresholds is None:
@@ -336,7 +337,7 @@ class FixedBinarization(Binarization):
         tgt = self._fold_target
         if tgt is not None:
             from ..kernels.dispatch import fold_ready
-            if fold_ready(self, tgt, raw_in):
+            if self._fold_armed and fold_ready(self, tgt, raw_in):
                 # fold: hand the raw input and the thresholds to the conv, which computes
                 # the leaf bits `x > t` inside its tree kernel; the bit tensor is never built
                 tgt._fold_thr = (t, jittered)
