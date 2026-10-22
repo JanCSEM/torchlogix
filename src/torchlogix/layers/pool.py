@@ -11,6 +11,12 @@ def _to_tuple(v, n):
 class OrPooling2d(torch.nn.Module):
     """Logic gate based pooling layer."""
 
+    # H027: the LogicConv2d that evaluates this pool inside its own kernel (set by
+    # torchlogix.backend.set_backend); None = this module pools.
+    _absorbed_by = None
+    _lut_req = None         # backend requested by set_backend (reach test)
+    _lut_ran = None         # "absorbed" | "torch": what the last forward did
+
     def __init__(self, kernel_size, stride, padding=0, export_mode=False,
                  ceil_mode=False):
         super(OrPooling2d, self).__init__()
@@ -30,6 +36,13 @@ class OrPooling2d(torch.nn.Module):
             return self._torch_or_bool(x)
 
         assert x.dim() == 4, "Input tensor must be 4d"
+
+        if self._absorbed_by is not None:
+            from ..kernels.dispatch import pool_absorbed
+            if pool_absorbed(self):
+                self._lut_ran = "absorbed"
+                return x
+        self._lut_ran = "torch"
 
         return F.max_pool2d(
             x.float(),

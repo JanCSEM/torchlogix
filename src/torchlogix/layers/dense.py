@@ -27,6 +27,8 @@ class LogicDense(LogicBase):
         connections_kwargs (dict): Additional keyword arguments for connections.
     """
 
+    _lut = None     # H027: backend state, set by torchlogix.backend.set_backend
+
     def __init__(
         self,
         in_dim: int,
@@ -82,6 +84,14 @@ class LogicDense(LogicBase):
         """
         assert x.ndim >= 2, x.ndim
         assert x.shape[-1] == self.in_dim, (x.shape[-1], self.in_dim)
+
+        if self._lut is not None and not self.export_mode:   # H027: backend dispatch
+            from ..kernels.dispatch import dense_forward
+            return dense_forward(self, x)
+        return self._forward_torch(x)
+
+    def _forward_torch(self, x):
+        """The reference path (backend "torch"); `forward` documents it."""
 
         if self.grad_factor != 1.0:
             x = GradFactor.apply(x, self.grad_factor)

@@ -39,6 +39,8 @@ class _LogicConvNd(LogicBase):
         connections (str): Type of connections to use ('fixed', 'learnable', etc.).
         connections_kwargs (dict): Additional keyword arguments for connections."""
 
+    _lut = None     # H027: backend state, set by torchlogix.backend.set_backend
+
     def __init__(
         self,
         in_dim: Union[_size_2_t, _size_3_t, int],
@@ -187,7 +189,13 @@ class _LogicConvNd(LogicBase):
         """
         if self.export_mode:
             return self._forward_export_mode(x)
-        
+        if self._lut is not None:           # H027: lut_backend / eval_backend dispatch
+            from ..kernels.dispatch import conv_forward
+            return conv_forward(self, x)
+        return self._forward_torch(x)
+
+    def _forward_torch(self, x):
+        """The reference path (backend "torch"); `forward` documents it."""
         x = self._pad(x)
         # First level tree indices
         x = self.connections(x, 0)
