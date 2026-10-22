@@ -20,7 +20,9 @@ def fuses_pool(layer) -> bool:
         return False
     if not layer.training and st.eval_backend == "packed":
         return True
-    return st.backend == "fused"
+    # bf16 storage: the pool must see the fp32 values (rounding BEFORE the max creates ties
+    # and re-routes the pool gradient), so the lookup path pools inside the conv too
+    return st.backend == "fused" or (st.backend == "lookup" and st.bf16 and not st.head)
 
 
 def _plan(layer, device):
@@ -76,6 +78,11 @@ def conv_forward(layer, x):
     if st.backend == "lookup":
         st.ran = "lookup"
         out = lookup.conv_forward(layer, x)
+        if fuses_pool(layer):
+            p = st.fused_pool
+            out = torch.nn.functional.max_pool2d(
+                out.float(), kernel_size=p.kernel_size, stride=p.stride, padding=p.padding,
+                ceil_mode=p.ceil_mode)
         return out.to(torch.bfloat16) if _out_dtype(st) else out
     # fused
     st.ran = "fused"

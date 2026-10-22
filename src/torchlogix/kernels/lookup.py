@@ -42,6 +42,21 @@ class _BitSelect(torch.autograd.Function):
         return None, None, torch.stack(gw, dim=-1)
 
 
+class _Pair(torch.autograd.Function):
+    """(.., S) -> (B, 2, .., S/2) pairing of neighbours as a VIEW (no gather, no copy).
+    The backward hands back a contiguous interleaved gradient, the layout the reference
+    gather's index-accumulate backward produces, so the downstream einsum backward
+    reduces in the same order and the whole backward stays bitwise equal."""
+
+    @staticmethod
+    def forward(ctx, out):
+        return out.unflatten(-1, (out.shape[-1] // 2, 2)).movedim(-1, 1)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g.movedim(1, -1).flatten(-2).contiguous()
+
+
 def check_binary(st, x) -> None:
     """One-time check that a layer marked `binary_input` really sees {0, 1}."""
     if st.binary_checked:
@@ -72,7 +87,7 @@ def conv_forward(layer, x):
             layer.connections(x, 0), layer.tree_weights[0], layer.training,
             contraction='fc,bcsf->bcsf')
     for level in range(1, layer.tree_depth):
-        v = out.unflatten(-1, (out.shape[-1] // 2, 2)).movedim(-1, 1)   # (B, 2, K, P, S/2)
+        v = _Pair.apply(out)                                  # (B, 2, K, P, S/2)
         out = layer.parametrization.forward(
             v, layer.tree_weights[level], layer.training, contraction='fc,bcsf->bcsf')
     return out.view(out.shape[0], out.shape[1], *layer.kernel_positions)

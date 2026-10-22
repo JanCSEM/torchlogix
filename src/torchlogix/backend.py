@@ -139,17 +139,17 @@ def set_backend(model, lut_backend="torch", lut_compile=False, eval_backend="tor
     return backend_report(model)
 
 
-def apply_compile(model, lut_backend: str) -> int:
+def apply_compile(model, lut_backend: str, backend: str = "inductor", mode=None) -> int:
     """lut_compile=true. fused: compile the model (kernels are custom ops, so Inductor
     fuses the glue around them); torch / lookup: compile every logic layer. In place
     (`nn.Module.compile`), so state_dict keys are unchanged. Returns the number of modules
     compiled."""
     if lut_backend == "fused":
-        model.compile()
+        model.compile(backend=backend, mode=mode)
         return 1
     n = 0
     for m in logic_layers(model):
-        m.compile()
+        m.compile(backend=backend, mode=mode)
         n += 1
     return n
 
