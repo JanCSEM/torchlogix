@@ -39,6 +39,9 @@ class LutState:
     binary_input: bool = False         # input is exactly {0, 1} (first layer after a bit front)
     fused_pool: Optional[object] = None
     ran: Optional[str] = None
+    ran_train: Optional[str] = None    # backend of the last training-mode forward
+    ran_eval: Optional[str] = None     # backend of the last eval-mode forward
+    lang: Optional[str] = None         # fused: kernel language resolved on the last call
     plan: Optional[dict] = field(default=None, repr=False)
     binary_checked: bool = False
     packed_checked: bool = False
@@ -164,7 +167,9 @@ def backend_report(model) -> list:
             out.append({"module": name, "type": type(m).__name__, "lut_backend": st.backend,
                         "lut_compile": st.compile, "eval_backend": st.eval_backend,
                         "bf16": st.bf16 and not st.head, "binary_input": st.binary_input,
-                        "pool_fused": st.fused_pool is not None, "ran": st.ran})
+                        "pool_fused": st.fused_pool is not None, "ran": st.ran,
+                        "ran_train": st.ran_train, "ran_eval": st.ran_eval,
+                        "lang": st.lang})
         elif isinstance(m, OrPooling2d) and m._lut_req is not None:
             out.append({"module": name, "type": "OrPooling2d", "lut_backend": m._lut_req,
                         "absorbed": m._absorbed_by is not None, "ran": m._lut_ran})

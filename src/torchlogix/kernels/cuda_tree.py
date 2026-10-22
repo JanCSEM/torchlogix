@@ -98,7 +98,7 @@ __global__ void fwd_kernel(const TX* __restrict__ x, const int* __restrict__ lea
       if (p < 0) continue;
       const int* lf = leaf + ((long)k * P + p) * 2 * S0;
       const float r = tree_root<TX, D>(x + (long)b * Nsrc, lf, w, K, k, v);
-      if (r > best) { best = r; barg = j; }
+      if (r > best || isnan(r)) { best = r; barg = j; }   // as max_pool2d: NaN propagates
     }
     const long o = ((long)b * K + k) * Q + q;
     st(y + o, best);

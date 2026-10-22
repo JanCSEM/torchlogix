@@ -92,7 +92,8 @@ def _fwd_kernel(x_ptr, leaf_ptr, pos_ptr, w_ptr, y_ptr, arg_ptr, B, K, P, Q, Nsr
         p = tl.load(pos_ptr + q * WIN + j, mask=valid, other=-1)
         ok = valid & (p >= 0)
         root = _tree_root(x_ptr, leaf_ptr, w_ptr, b, k, p, ok, K, P, Nsrc, D, BINARY, BLOCK)
-        upd = ok & (root > best)
+        # same rule as max_pool2d: first max on ties, a NaN always replaces (propagates)
+        upd = ok & ((root > best) | (root != root))
         best = tl.where(upd, root, best)
         arg = tl.where(upd, j, arg)
     o = (b.to(tl.int64) * K + k) * Q + q

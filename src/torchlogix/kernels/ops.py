@@ -31,9 +31,20 @@ def triton_available() -> bool:
 
 
 def resolve_lang(device_type: str) -> str:
+    """The implementation a call on `device_type` uses. An explicitly requested language
+    that is unavailable RAISES (no silent fallback); "auto" picks Triton when importable,
+    else CUDA C++, and the pick is recorded by the callers (`LutState.lang`)."""
     if device_type == "cuda":
-        if FUSED_LANG in ("triton", "cuda"):
-            return FUSED_LANG
+        if FUSED_LANG not in ("auto", "triton", "cuda"):
+            raise ValueError(f"FUSED_LANG / TORCHLOGIX_FUSED_LANG must be auto|triton|cuda, "
+                             f"got {FUSED_LANG!r}")
+        if FUSED_LANG == "triton":
+            if not triton_available():
+                raise RuntimeError("kernel language 'triton' was requested but triton is "
+                                   "not importable")
+            return "triton"
+        if FUSED_LANG == "cuda":
+            return "cuda"             # a build failure (nvcc, ninja) raises in cuda_tree
         return "triton" if triton_available() else "cuda"
     return CPU_IMPL
 

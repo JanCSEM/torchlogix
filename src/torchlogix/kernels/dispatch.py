@@ -1,7 +1,7 @@
 """Layer-level dispatch for `lut_backend` / `eval_backend` (set by `torchlogix.backend`).
 
 The reference arithmetic stays in the layers (`_forward_torch`); this module routes to the
-alternatives and records the backend that ran in `layer._lut.ran`.
+alternatives and records the backend that ran in `layer._lut.ran` (+ `ran_train`, `ran_eval`, `lang`).
 """
 
 import torch
@@ -66,17 +66,30 @@ def _out_dtype(st):
     return st.bf16 and not st.head
 
 
+def _mark(layer, what, lang=None):
+    """Record what ran: last call, last training-mode call, last eval-mode call, and for
+    the fused backend the kernel language that was resolved (`ops.resolve_lang`)."""
+    st = layer._lut
+    st.ran = what
+    if layer.training:
+        st.ran_train = what
+    else:
+        st.ran_eval = what
+    if lang is not None:
+        st.lang = lang
+
+
 def conv_forward(layer, x):
     st = layer._lut
     if st.backend == "torch" and (layer.training or st.eval_backend != "packed"):
-        st.ran = "torch"
+        _mark(layer, "torch")
         return layer._forward_torch(x)
     if not layer.training and st.eval_backend == "packed":
         pool = st.fused_pool if fuses_pool(layer) else None
-        st.ran = "packed"
+        _mark(layer, "packed")
         return packed.conv_forward(layer, x, pool)
     if st.backend == "lookup":
-        st.ran = "lookup"
+        _mark(layer, "lookup")
         out = lookup.conv_forward(layer, x)
         if fuses_pool(layer):
             p = st.fused_pool
@@ -85,7 +98,7 @@ def conv_forward(layer, x):
                 ceil_mode=p.ceil_mode)
         return out.to(torch.bfloat16) if _out_dtype(st) else out
     # fused
-    st.ran = "fused"
+    _mark(layer, "fused", ops.resolve_lang(x.device.type))
     plan = _plan(layer, x.device)
     xin = _to_kernel_input(st, layer._pad(x))
     w = torch.cat([s.reshape(-1) for s in lookup.sample_levels(layer)])
@@ -99,16 +112,16 @@ def conv_forward(layer, x):
 def dense_forward(layer, x):
     st = layer._lut
     if st.backend == "torch" and (layer.training or st.eval_backend != "packed"):
-        st.ran = "torch"
+        _mark(layer, "torch")
         return layer._forward_torch(x)
     if not layer.training and st.eval_backend == "packed":
-        st.ran = "packed"
+        _mark(layer, "packed")
         return packed.dense_forward(layer, x)
     if st.backend == "lookup":
-        st.ran = "lookup"
+        _mark(layer, "lookup")
         out = lookup.dense_forward(layer, x)
         return out.to(torch.bfloat16) if _out_dtype(st) else out
-    st.ran = "fused"
+    _mark(layer, "fused", ops.resolve_lang(x.device.type))
     from ..functional import GradFactor
     if layer.grad_factor != 1.0:
         x = GradFactor.apply(x, layer.grad_factor)
