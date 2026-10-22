@@ -25,7 +25,11 @@ def fuses_pool(layer) -> bool:
     return st.backend == "fused" or (st.backend == "lookup" and st.bf16 and not st.head)
 
 
+@torch.compiler.disable
 def _plan(layer, device):
+    # static tables built eagerly on first use: dynamo must not trace the CPU table
+    # construction (job 5123806: Inductor tried to compile it for the CPU), so this is a
+    # deliberate, single graph break per layer
     st = layer._lut
     ref = layer.connections._indices_L0 if hasattr(layer.connections, "_indices_L0") \
         else layer.connections.indices
