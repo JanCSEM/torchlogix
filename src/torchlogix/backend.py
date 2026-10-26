@@ -72,7 +72,7 @@ def logic_layers(model):
     return [m for m in model.modules() if isinstance(m, (LogicConv2d, LogicDense))]
 
 
-def _validate(m, lut_backend="torch"):
+def _validate(m, lut_backend):
     if isinstance(m, LogicConv3d):
         raise ValueError("lut backends do not support LogicConv3d (thermo3d)")
     if not isinstance(m.parametrization, LightLUTParametrization):
