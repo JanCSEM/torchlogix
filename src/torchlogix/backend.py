@@ -150,6 +150,8 @@ def _pair_folds(model):
                         and b._lut is not None and b._lut.binary_input):
                     if a.thresh_jitter > 0.0 and a.thresh_jitter_mode == "indep":
                         continue                         # a post-compare flip: no fold
+                    if b.padding_mode != "zeros":
+                        continue                         # H037: the fold tables assume zero padding
                     pairs.append((a, b))
                     paired.add(id(b))
                     _arm_with(mod, a)
@@ -157,6 +159,8 @@ def _pair_folds(model):
     for m in logic_layers(model)[:1]:                    # the first logic layer is the candidate
         if id(m) not in paired:
             notes[id(m)] = (
+                "not applied: replicate padding (the fold tables assume zero padding)"
+                if getattr(m, "padding_mode", "zeros") != "zeros" else
                 "not applied: the first logic layer is not a LogicConv2d directly behind a "
                 "FixedBinarization (or the jitter mode is indep)" if m._lut.binary_input else
                 "not applied: the first logic layer does not take a thermometer front")

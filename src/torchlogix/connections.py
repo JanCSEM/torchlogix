@@ -254,7 +254,24 @@ class FixedDenseConnections(Connections):
     
     def forward(self, x):
         return x[:, self.indices]
-    
+
+    @torch.no_grad()
+    def redraw_neuron_taps(self, neurons, generator: torch.Generator) -> None:
+        """H037 revival: redraw the ``lut_rank`` input taps of each neuron in ``neurons``,
+        IN PLACE, uniformly over the input ids (distinct taps unless ``init_method`` is
+        "random"). ``generator`` is a CPU generator: no global RNG stream is touched."""
+        neurons = torch.as_tensor(neurons, dtype=torch.int64).flatten().cpu()
+        if neurons.numel() == 0:
+            return
+        n, L = neurons.numel(), self.lut_rank
+        if self.init_method == "random":
+            new = torch.randint(0, self.in_dim, (n, L), generator=generator)
+        else:
+            if self.in_dim < L:
+                raise ValueError(f"cannot draw {L} distinct taps from {self.in_dim} inputs")
+            new = torch.rand(n, self.in_dim, generator=generator).argsort(dim=1)[:, :L]
+        self.indices[:, neurons.to(self.indices.device)] = new.t().to(self.indices)
+
 
 class LearnableConnectionFunction(torch.autograd.Function):
     """Autograd function for learnable connections.
@@ -529,6 +546,107 @@ class FixedConvConnections(Connections):
         # Build tree indices
         return self._get_indices_from_kernel_tensor(kernels)
 
+
+    def kernel_window(self, k: int):
+        """The input channels kernel ``k`` may read (the init rule): its private block when
+        ``channel_groups`` is set, then the contiguous window of ``channel_group_size``
+        channels the kernel was assigned (``None`` window: the whole block)."""
+        g = self.channel_group_size
+        G = self.channel_groups or 1
+        c_blk = self.channels // G
+        kpb = self.num_kernels // G
+        base = (k // kpb) * c_blk
+        if g is None:
+            return torch.arange(base, base + c_blk)
+        starts = torch.arange(0, c_blk - g + 1)
+        return base + starts[(k % kpb) % starts.numel()] + torch.arange(g)
+
+    @torch.no_grad()
+    def redraw_kernel_taps(self, kernels, generator: torch.Generator) -> None:
+        """H037 revival: redraw ALL leaf taps of each kernel in ``kernels`` IN PLACE
+        (``_indices_L0`` keeps its address; the tree levels >= 1 are pairings and do not
+        change). The draw follows the layer's own rule: channels from ``kernel_window``;
+        within the window, receptive-field positions uniformly (per-channel balanced when a
+        window is set, without replacement when ``tree_tap_draw`` is "no-replace"); the two
+        taps of a leaf gate are distinct unless ``init_method`` is "random". ``generator``
+        is a CPU generator: no global RNG stream is touched."""
+        kernels = [int(k) for k in torch.as_tensor(kernels).flatten().tolist()]
+        if not kernels:
+            return
+        L = self.lut_rank
+        sample = L ** (self.tree_depth - 1)
+        total = L * sample
+        rf_axes = [torch.arange(0, d) for d in self.receptive_field_size]
+        spatial = torch.stack([g.flatten() for g in torch.meshgrid(*rf_axes, indexing="ij")], 1)
+        distinct = self.init_method != "random"
+        no_replace = self.tree_tap_draw == "no-replace"
+        g_ = self.channel_group_size
+
+        def distinct_pairs(coords):                   # (sample, L, nd+1): swap until distinct
+            for _ in range(1000):
+                same = (coords.unsqueeze(1) == coords.unsqueeze(2)).all(-1) \
+                    & ~torch.eye(L, dtype=torch.bool)
+                dup = same.any(-1).any(-1)
+                if not dup.any():
+                    return coords
+                flat = coords.reshape(sample * L, -1)
+                for j in torch.nonzero(dup).flatten().tolist():
+                    a, b = torch.nonzero(torch.triu(same[j], diagonal=1))[0].tolist()
+                    r = int(torch.randint(0, sample * L, (1,), generator=generator))
+                    tmp = flat[j * L + b].clone()
+                    flat[j * L + b] = flat[r]
+                    flat[r] = tmp
+                coords = flat.view(sample, L, -1)
+            raise ValueError("could not give every gate distinct inputs")
+
+        out = []
+        for k in kernels:
+            chans = self.kernel_window(k)
+            if g_ is None:
+                grid = torch.meshgrid(*rf_axes, chans, indexing="ij")
+                allp = torch.stack([x.flatten() for x in grid], 1)
+                n = allp.shape[0]
+                if no_replace:
+                    full, rem = divmod(total, n)
+                    parts = [torch.randperm(n, generator=generator) for _ in range(full)]
+                    if rem:
+                        parts.append(torch.randperm(n, generator=generator)[:rem])
+                    idx = torch.cat(parts).view(sample, L)
+                elif distinct:
+                    if n < L:
+                        raise ValueError(f"need >= {L} candidate inputs per kernel, got {n}")
+                    idx = torch.rand(sample, n, generator=generator).argsort(dim=1)[:, :L]
+                else:
+                    idx = torch.randint(0, n, (sample, L), generator=generator)
+                coords = allp[idx]
+            else:
+                if total % g_:
+                    raise ValueError(f"cannot distribute {total} taps over {g_} channels")
+                per = total // g_
+                chunks = []
+                for c in chans.tolist():
+                    if no_replace:
+                        full, rem = divmod(per, spatial.shape[0])
+                        parts = [torch.randperm(spatial.shape[0], generator=generator)
+                                 for _ in range(full)]
+                        if rem:
+                            parts.append(torch.randperm(spatial.shape[0],
+                                                        generator=generator)[:rem])
+                        pick = torch.cat(parts)
+                    else:
+                        pick = torch.randint(0, spatial.shape[0], (per,), generator=generator)
+                    chunks.append(torch.cat([spatial[pick], torch.full((per, 1), c)], 1))
+                coords = torch.cat(chunks)[torch.randperm(total, generator=generator)]
+                coords = coords.view(sample, L, -1)
+                if distinct:
+                    coords = distinct_pairs(coords)
+            out.append(coords)
+        coords = torch.stack(out, 0).permute(2, 0, 1, 3)          # (L, n_kernels, S, nd+1)
+        if any(d > 1 for d in self.dilation):
+            coords = coords * torch.tensor([*self.dilation, 1])
+        full = self._apply_sliding_window_tensor(coords.to(self.device))   # (L, nk, P, S, nd+1)
+        buf = self._indices_L0
+        buf[:, torch.tensor(kernels, device=buf.device)] = full.to(buf)
 
     def pool_report(self):
         """Candidate pool of one tree, for the dry-run (tree_tap_draw rule).

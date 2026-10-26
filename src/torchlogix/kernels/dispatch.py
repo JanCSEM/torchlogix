@@ -36,17 +36,45 @@ def _get_plan(layer, device):
     return _plan(layer, device)
 
 
+def _plan_key(layer, device):
+    st = layer._lut
+    ref = layer.connections._indices_L0 if hasattr(layer.connections, "_indices_L0") \
+        else layer.connections.indices
+    return (str(device), ref.data_ptr(), ref._version,
+            None if st.fused_pool is None else (st.fused_pool.kernel_size, st.fused_pool.stride,
+                                                st.fused_pool.padding, st.fused_pool.ceil_mode))
+
+
+def refresh_plan(layer) -> bool:
+    """H037: re-derive the plan's leaf table from the layer's CURRENT taps IN PLACE, so a
+    CUDA graph that captured the table by address keeps reading valid data after the taps
+    were redrawn (`FixedConvConnections.redraw_kernel_taps`). The tensor object, its address
+    and its shape are unchanged; the plan key is advanced so `_plan` does not rebuild it.
+    Returns False when the layer has no plan yet (nothing captured it)."""
+    st = layer._lut
+    plan = st.plan if st is not None else None
+    if plan is None:
+        return False
+    if st.fold_plan is not None:
+        raise RuntimeError("refresh_plan: the H030 fold plan is not refreshed (fold + revival "
+                           "is not supported)")
+    dev = plan["leaf"].device
+    leaf = (conv_leaf_table(layer) if hasattr(layer, "kernel_positions")
+            else dense_leaf_table(layer)).to(dev)
+    if leaf.shape != plan["leaf"].shape or leaf.dtype != plan["leaf"].dtype:
+        raise RuntimeError("refresh_plan: the leaf table changed shape")
+    plan["leaf"].copy_(leaf)
+    plan["key"] = _plan_key(layer, dev)
+    return True
+
+
 @torch.compiler.disable
 def _plan(layer, device):
     # static tables built eagerly on first use: dynamo must not trace the CPU table
     # construction (job 5123806: Inductor tried to compile it for the CPU), so this is a
     # deliberate, single graph break per layer
     st = layer._lut
-    ref = layer.connections._indices_L0 if hasattr(layer.connections, "_indices_L0") \
-        else layer.connections.indices
-    key = (str(device), ref.data_ptr(), ref._version,
-           None if st.fused_pool is None else (st.fused_pool.kernel_size, st.fused_pool.stride,
-                                               st.fused_pool.padding, st.fused_pool.ceil_mode))
+    key = _plan_key(layer, device)
     if st.plan is not None and st.plan["key"] == key:
         return st.plan
     if hasattr(layer, "kernel_positions"):

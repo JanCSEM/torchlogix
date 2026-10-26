@@ -12,6 +12,38 @@ from ..functional import (
 from .base import LogicBase
 
 
+PADDING_MODES = ("zeros", "replicate")
+
+
+def replicate_pad(x, padding):
+    """Edge-replicate the trailing ``len(padding)`` axes of ``x`` by ``padding[i]`` on both
+    sides (H037). A gather, so it works on any dtype (float activations, packed int64 words,
+    int64 node ids of the netlist extractor). A padded cell holds the value of the nearest
+    real cell, so a border tap reads a real input instead of a constant 0."""
+    n = len(padding)
+    for ax, p in zip(range(x.dim() - n, x.dim()), padding):
+        if p:
+            size = x.shape[ax]
+            idx = torch.arange(-p, size + p, device=x.device).clamp_(0, size - 1)
+            x = x.index_select(ax, idx)
+    return x
+
+
+def set_padding_mode(model, mode: str) -> int:
+    """Set ``padding_mode`` on every conv layer of ``model`` that pads; returns how many."""
+    if mode not in PADDING_MODES:
+        raise ValueError(f"padding_mode must be one of {PADDING_MODES}, got {mode!r}")
+    n = 0
+    for m in model.modules():
+        if isinstance(m, _LogicConvNd) and any(m.padding):
+            lut = getattr(m, "_lut", None)
+            if mode != "zeros" and lut is not None and lut.fold:
+                raise ValueError("replicate padding is not implemented for the H030 fold")
+            m.padding_mode = mode
+            n += 1
+    return n
+
+
 class _LogicConvNd(LogicBase):
     """Abstract baseclass for convolutional logic layers.
     This module provides common functionality for 2D and 3D logic convolutional
@@ -26,8 +58,11 @@ class _LogicConvNd(LogicBase):
         receptive_field_size: Spatial size (depth, height and width) of the
             receptive field (assumed cubic).
         stride: Convolution stride in all spatial dimensions.
-        padding: Zero-padding applied symmetrically to depth, height and width
-            before selecting receptive fields.
+        padding: Padding applied symmetrically to depth, height and width
+            before selecting receptive fields (zeros, or the edge value with
+            ``padding_mode="replicate"``).
+        padding_mode: ``"zeros"`` (default) or ``"replicate"`` (H037: a padded cell
+            repeats the nearest real cell).
         dilation: Spacing between receptive-field taps, per axis (int or tuple). A
             kernel of size k spans dilation * (k - 1) + 1 positions. Default 1.
         conv_dimension: Dimension of the convolution (2 or 3).
@@ -41,6 +76,7 @@ class _LogicConvNd(LogicBase):
 
     _lut = None     # H027: backend state, set by torchlogix.backend.set_backend
     _fold_thr = None    # H030: (thresholds, jittered) handed by the FixedBinarization in front
+    padding_mode = "zeros"   # H037: "zeros" | "replicate"
 
     def __init__(
         self,
@@ -53,6 +89,7 @@ class _LogicConvNd(LogicBase):
         padding: int = 0,
         dilation: int = 1,
         conv_dimension: int = 2,
+        padding_mode: str = "zeros",
         device: str = "cpu",
         grad_factor: float = 1.0,
         lut_rank: int = 2,
@@ -74,6 +111,9 @@ class _LogicConvNd(LogicBase):
         self.tree_depth = tree_depth
         self.channels = channels
         self.conv_dimension = conv_dimension
+        if padding_mode not in PADDING_MODES:
+            raise ValueError(f"padding_mode must be one of {PADDING_MODES}, got {padding_mode!r}")
+        self.padding_mode = padding_mode
         assert conv_dimension in [2, 3], "conv_dimension must be 2 or 3"
         if conv_dimension == 2:
             self.receptive_field_size = _pair(receptive_field_size)
@@ -121,6 +161,8 @@ class _LogicConvNd(LogicBase):
         """
         if not any(self.padding):
             return x
+        if self.padding_mode == "replicate":
+            return replicate_pad(x, self.padding)
         pad = []
         for p in reversed(self.padding):
             pad.extend((p, p))
@@ -342,6 +384,7 @@ class LogicConv2d(_LogicConvNd):
         parametrization_kwargs: dict = None,
         connections: str = "fixed",
         connections_kwargs: dict = None,
+        padding_mode: str = "zeros",
     ):
         super().__init__(
             in_dim=in_dim,
@@ -352,6 +395,7 @@ class LogicConv2d(_LogicConvNd):
             stride=stride,
             padding=padding,
             dilation=dilation,
+            padding_mode=padding_mode,
             conv_dimension=2,
             device=device,
             grad_factor=grad_factor,
@@ -389,6 +433,7 @@ class LogicConv3d(_LogicConvNd):
         parametrization_kwargs: dict = None,
         connections: str = "fixed",
         connections_kwargs: dict = None,
+        padding_mode: str = "zeros",
     ):
         super().__init__(
             in_dim=in_dim,
@@ -399,6 +444,7 @@ class LogicConv3d(_LogicConvNd):
             stride=stride,
             padding=padding,
             dilation=dilation,
+            padding_mode=padding_mode,
             conv_dimension=3,
             device=device,
             grad_factor=grad_factor,
