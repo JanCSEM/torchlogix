@@ -269,7 +269,16 @@ class FixedDenseConnections(Connections):
         else:
             if self.in_dim < L:
                 raise ValueError(f"cannot draw {L} distinct taps from {self.in_dim} inputs")
-            new = torch.rand(n, self.in_dim, generator=generator).argsort(dim=1)[:, :L]
+            # ordered L-tuples of distinct ids, uniform: draw tap j among the in_dim - j ids not yet taken
+            # (no (n, in_dim) matrix: a 40,960-neuron layer over 40,960 inputs would be 6.7 GB)
+            new = torch.empty(n, L, dtype=torch.int64)
+            for j in range(L):
+                t = torch.randint(0, self.in_dim - j, (n,), generator=generator)
+                if j:
+                    prev = new[:, :j].sort(dim=1).values
+                    for i in range(j):                     # skip over the ids already taken
+                        t = t + (t >= prev[:, i] - i).long()
+                new[:, j] = t
         self.indices[:, neurons.to(self.indices.device)] = new.t().to(self.indices)
 
 
