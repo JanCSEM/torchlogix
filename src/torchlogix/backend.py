@@ -72,14 +72,16 @@ def logic_layers(model):
     return [m for m in model.modules() if isinstance(m, (LogicConv2d, LogicDense))]
 
 
-def _validate(m):
+def _validate(m, lut_backend):
     if isinstance(m, LogicConv3d):
         raise ValueError("lut backends do not support LogicConv3d (thermo3d)")
     if not isinstance(m.parametrization, LightLUTParametrization):
         raise ValueError(f"lut backends need parametrization='light', got "
                          f"{type(m.parametrization).__name__}")
     p = m.parametrization
-    if p.forward_sampling != "soft":
+    # H038: lut_backend="torch" trains through the reference forward, which implements every
+    # sampling mode; only lookup / fused need soft. (The packed eval is the committed function.)
+    if p.forward_sampling != "soft" and lut_backend != "torch":
         raise ValueError(f"lut backends need forward_sampling='soft', got {p.forward_sampling!r}")
     if p.materialize_basis:
         raise ValueError("lut backends do not support materialize_basis")
@@ -209,7 +211,7 @@ def set_backend(model, lut_backend="torch", lut_compile=False, eval_backend="tor
     layers = logic_layers(model)
     if not default:
         for m in layers:
-            _validate(m)
+            _validate(m, lut_backend)
         if any(isinstance(m, LogicConv3d) for m in model.modules()):
             raise ValueError("lut backends do not support LogicConv3d (thermo3d)")
         if not layers:
