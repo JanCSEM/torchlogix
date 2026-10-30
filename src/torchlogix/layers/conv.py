@@ -36,9 +36,6 @@ def set_padding_mode(model, mode: str) -> int:
     n = 0
     for m in model.modules():
         if isinstance(m, _LogicConvNd) and any(m.padding):
-            lut = getattr(m, "_lut", None)
-            if mode != "zeros" and lut is not None and lut.fold:
-                raise ValueError("replicate padding is not implemented for the H030 fold")
             m.padding_mode = mode
             n += 1
     return n
