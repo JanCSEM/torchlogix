@@ -464,6 +464,7 @@ class FixedConvConnections(Connections):
             channel_group_size: int = None,
             channel_groups: int = None,
             tree_tap_draw: str = None,  # None -> default_tree_tap_draw | "replace" | "no-replace"
+            channel_block_sizes=None,   # H052: ragged private blocks (see below); None = equal blocks
             **kwargs
         ):
         super().__init__(
@@ -510,8 +511,23 @@ class FixedConvConnections(Connections):
         # e.g. per electrode in a folded (B, electrodes*bits, 1, T) layout.
         # channel_group_size (if set) then picks a contiguous window INSIDE the block.
         self.channel_groups = int(channel_groups) if channel_groups else None
+        # channel_block_sizes (H052): the G private blocks need not be equally wide. Block b has
+        # sizes[b] contiguous channels (blocks in order, sum = channels) and still num_kernels // G
+        # kernels; the draw is the equal-block draw per block, so equal sizes reproduce it exactly.
+        self.channel_block_sizes = None
+        if channel_block_sizes is not None:
+            sizes = [int(v) for v in channel_block_sizes]
+            if (not self.channel_groups or len(sizes) != self.channel_groups or min(sizes) < 1
+                    or sum(sizes) != channels):
+                raise ValueError(f"channel_block_sizes {sizes} needs channel_groups entries, each >= 1, "
+                                 f"summing to channels ({channels}); channel_groups={self.channel_groups}")
+            if channel_group_size is not None or init_method == "random-unique":
+                raise ValueError("channel_block_sizes is for whole-block draws (no channel_group_size, "
+                                 "not random-unique)")
+            self.channel_block_sizes = tuple(sizes)
+            self._block_base = tuple(sum(sizes[:b]) for b in range(len(sizes)))
         if self.channel_groups:
-            assert channels % self.channel_groups == 0, (
+            assert self.channel_block_sizes is not None or channels % self.channel_groups == 0, (
                 f"channels ({channels}) must be divisible by channel_groups "
                 f"({self.channel_groups})")
             assert num_kernels % self.channel_groups == 0, (
@@ -556,6 +572,23 @@ class FixedConvConnections(Connections):
         return self._get_indices_from_kernel_tensor(kernels)
 
 
+    def _block(self, k: int):
+        """(first channel, number of channels) of the private block kernel ``k`` lives in."""
+        G = self.channel_groups or 1
+        kpb = self.num_kernels // G
+        if self.channel_block_sizes is None:
+            c_blk = self.channels // G
+            return (k // kpb) * c_blk, c_blk
+        b = k // kpb
+        return self._block_base[b], self.channel_block_sizes[b]
+
+    @property
+    def min_block_channels(self) -> int:
+        """Channels of the narrowest private block (all of them when the blocks are equal)."""
+        if self.channel_block_sizes is not None:
+            return min(self.channel_block_sizes)
+        return self.channels // (self.channel_groups or 1)
+
     def kernel_window(self, k: int):
         """The input channels kernel ``k`` may read (the init rule): its private block when
         ``channel_groups`` is set, then the contiguous window of ``channel_group_size``
@@ -564,9 +597,9 @@ class FixedConvConnections(Connections):
         G = self.channel_groups or 1
         c_blk = self.channels // G
         kpb = self.num_kernels // G
-        base = (k // kpb) * c_blk
+        base, c_blk_k = self._block(k)
         if g is None:
-            return torch.arange(base, base + c_blk)
+            return torch.arange(base, base + c_blk_k)
         starts = torch.arange(0, c_blk - g + 1)
         return base + starts[(k % kpb) % starts.numel()] + torch.arange(g)
 
@@ -667,7 +700,7 @@ class FixedConvConnections(Connections):
         for d in self.receptive_field_size:
             rf *= d
         leaves = self.lut_rank ** self.tree_depth
-        c_blk = self.channels // (self.channel_groups or 1)
+        c_blk = self.min_block_channels
         g = self.channel_group_size
         if g is None:
             pool, sub, per_ch = rf * c_blk, None, None
@@ -727,11 +760,11 @@ class FixedConvConnections(Connections):
         coords_per_kernel = []
 
         for k in range(self.num_kernels):
-            base = (k // kpb) * c_blk
+            base, c_blk_k = self._block(k)
             k_loc = k % kpb
 
             if g is None:
-                c_rf = base + torch.arange(0, c_blk, device=device)
+                c_rf = base + torch.arange(0, c_blk_k, device=device)
 
                 # full 3D position space
                 grid = torch.meshgrid(*rf_axes, c_rf, indexing="ij")
