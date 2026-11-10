@@ -521,9 +521,12 @@ class FixedConvConnections(Connections):
                     or sum(sizes) != channels):
                 raise ValueError(f"channel_block_sizes {sizes} needs channel_groups entries, each >= 1, "
                                  f"summing to channels ({channels}); channel_groups={self.channel_groups}")
-            if channel_group_size is not None or init_method == "random-unique":
-                raise ValueError("channel_block_sizes is for whole-block draws (no channel_group_size, "
-                                 "not random-unique)")
+            if init_method == "random-unique":
+                raise ValueError("channel_block_sizes is not implemented for random-unique")
+            if channel_group_size is not None and min(sizes) <= channel_group_size:
+                # H056: a window of channel_group_size channels inside each (ragged) block
+                raise ValueError(f"channel_group_size {channel_group_size} must be smaller than every block "
+                                 f"in channel_block_sizes {sizes}")
             self.channel_block_sizes = tuple(sizes)
             self._block_base = tuple(sum(sizes[:b]) for b in range(len(sizes)))
         if self.channel_groups:
@@ -535,7 +538,8 @@ class FixedConvConnections(Connections):
                 f"({self.channel_groups})")
         self.channel_group_size = channel_group_size
         if channel_group_size is not None:
-            per_block = channels // (self.channel_groups or 1)
+            per_block = (min(self.channel_block_sizes) if self.channel_block_sizes is not None
+                         else channels // (self.channel_groups or 1))
             assert per_block > channel_group_size, (
                 "channel_group_size must be smaller than the number of channels "
                 "(per block when channel_groups is set)"
@@ -600,7 +604,7 @@ class FixedConvConnections(Connections):
         base, c_blk_k = self._block(k)
         if g is None:
             return torch.arange(base, base + c_blk_k)
-        starts = torch.arange(0, c_blk - g + 1)
+        starts = torch.arange(0, c_blk_k - g + 1)      # H056: this block's windows (ragged blocks)
         return base + starts[(k % kpb) % starts.numel()] + torch.arange(g)
 
     @torch.no_grad()
@@ -751,11 +755,6 @@ class FixedConvConnections(Connections):
         kpb = self.num_kernels // G
         distinct = self.init_method == "random-distinct"
         no_replace = self.tree_tap_draw == "no-replace"
-        if g is None:
-            starts = None
-        else:
-            starts = torch.arange(0, c_blk - g + 1, device=device)
-            num_groups = starts.numel()
 
         coords_per_kernel = []
 
@@ -796,7 +795,7 @@ class FixedConvConnections(Connections):
                 coords_k = all_positions[idx]
 
             else:
-                start = base + starts[k_loc % num_groups]
+                start = base + (k_loc % (c_blk_k - g + 1))      # H056: windows of this block (ragged blocks)
                 c_rf = start + torch.arange(g, device=device)
 
                 if total_inputs % g != 0:
