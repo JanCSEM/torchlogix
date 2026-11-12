@@ -139,23 +139,28 @@ def _arm_with(seq, binarizer):
     seq._fold_bins.append(binarizer)
 
 
-def declare_fold(binarizer, conv) -> None:
-    """Declare that `binarizer`'s output feeds `conv` directly (nothing runs between them), so the fold
-    can pair them wherever the two sit in the model. A plain attribute (not a child module: no state_dict
-    entry, no double registration); the pair is armed while the whole model runs."""
-    if not isinstance(binarizer, FixedBinarization) or not isinstance(conv, LogicConv2d):
-        raise TypeError("declare_fold pairs a FixedBinarization with a LogicConv2d")
-    object.__setattr__(binarizer, "_fold_declared", conv)
+def allow_fused_thermometer(thermometer, conv) -> bool:
+    """Say that `thermometer`'s output feeds `conv` directly (nothing runs between them), so the fused backend
+    may compute the thermometer's comparisons inside that conv's kernel (`set_backend(fold=True)` /
+    `TORCHLOGIX_FOLD=1`) wherever the two sit in the model. A plain attribute (not a child module: no
+    state_dict entry, no double registration); the pair is armed while the whole model runs. Returns False
+    and does nothing when `thermometer` is not a FixedBinarization (a feature front, say)."""
+    if not isinstance(conv, LogicConv2d):
+        raise TypeError("allow_fused_thermometer pairs a FixedBinarization with a LogicConv2d")
+    if not isinstance(thermometer, FixedBinarization):
+        return False
+    object.__setattr__(thermometer, "_fused_thermometer_conv", conv)
+    return True
 
 
 def _pair_folds(model):
     """(binarizer, conv) pairs for the H030 fold: a FixedBinarization directly followed by
     the first logic conv (a binary-input LogicConv2d) in one Sequential, or declared with
-    `declare_fold` (armed while the whole model runs). Returns (pairs, notes) where notes maps
+    `allow_fused_thermometer` (armed while the whole model runs). Returns (pairs, notes) where notes maps
     id(first logic layer) -> why it is not folded."""
     pairs, paired = [], set()
     for a in (m for m in model.modules() if isinstance(m, FixedBinarization)):
-        b = getattr(a, "_fold_declared", None)
+        b = getattr(a, "_fused_thermometer_conv", None)
         if (b is not None and b._lut is not None and b._lut.binary_input and id(b) not in paired
                 and not (a.thresh_jitter > 0.0 and a.thresh_jitter_mode == "indep")):
             pairs.append((a, b))

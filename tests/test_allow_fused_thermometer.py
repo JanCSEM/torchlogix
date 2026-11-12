@@ -1,5 +1,5 @@
 """The thermometer fold pairs a FixedBinarization with the conv it feeds, by adjacency in one Sequential or
-by `declare_fold` (the two may sit anywhere in the model). On CPU (the reference kernel) the fold is bitwise
+by `allow_fused_thermometer` (the two may sit anywhere in the model). On CPU (the reference kernel) the fold is bitwise
 the unfolded fused path; a fold that was requested and cannot apply raises."""
 
 import copy
@@ -7,7 +7,7 @@ import copy
 import pytest
 import torch
 
-from torchlogix.backend import backend_report, declare_fold, set_backend
+from torchlogix.backend import backend_report, allow_fused_thermometer, set_backend
 from torchlogix.layers import GroupSum, LogicConv2d, LogicDense, OrPooling2d
 from torchlogix.layers.binarization import FixedBinarization
 
@@ -33,7 +33,7 @@ class Apart(torch.nn.Module):
         self.head = torch.nn.Sequential(torch.nn.Flatten(), dense)
         self.vote = GroupSum(k=2, tau=1.0)
         if declared:
-            declare_fold(bits, conv)
+            allow_fused_thermometer(bits, conv)
 
     def forward(self, x):
         return self.vote(self.head(self.block(self.encoder(x))))
@@ -87,7 +87,9 @@ def test_a_requested_fold_that_cannot_apply_raises_and_off_does_not():
         set_backend(m, "fused", fold=True)
 
 
-def test_declare_fold_checks_its_arguments():
+def test_allow_fused_thermometer_checks_its_arguments():
     bits, conv, _, dense = _parts()
     with pytest.raises(TypeError):
-        declare_fold(bits, dense)
+        allow_fused_thermometer(bits, dense)
+    assert allow_fused_thermometer(bits, conv) is True
+    assert allow_fused_thermometer(torch.nn.Identity(), conv) is False
