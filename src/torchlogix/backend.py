@@ -139,17 +139,39 @@ def _arm_with(seq, binarizer):
     seq._fold_bins.append(binarizer)
 
 
+def allow_fused_thermometer(thermometer, conv) -> bool:
+    """Say that `thermometer`'s output feeds `conv` directly (nothing runs between them), so the fused backend
+    may compute the thermometer's comparisons inside that conv's kernel (`set_backend(fold=True)` /
+    `TORCHLOGIX_FOLD=1`) wherever the two sit in the model. A plain attribute (not a child module: no
+    state_dict entry, no double registration); the pair is armed while the whole model runs. Returns False
+    and does nothing when `thermometer` is not a FixedBinarization (a feature front, say)."""
+    if not isinstance(conv, LogicConv2d):
+        raise TypeError("allow_fused_thermometer pairs a FixedBinarization with a LogicConv2d")
+    if not isinstance(thermometer, FixedBinarization):
+        return False
+    object.__setattr__(thermometer, "_fused_thermometer_conv", conv)
+    return True
+
+
 def _pair_folds(model):
     """(binarizer, conv) pairs for the H030 fold: a FixedBinarization directly followed by
-    the first logic conv (a binary-input LogicConv2d) in one Sequential. Returns
-    (pairs, notes) where notes maps id(first logic layer) -> why it is not folded."""
+    the first logic conv (a binary-input LogicConv2d) in one Sequential, or declared with
+    `allow_fused_thermometer` (armed while the whole model runs). Returns (pairs, notes) where notes maps
+    id(first logic layer) -> why it is not folded."""
     pairs, paired = [], set()
+    for a in (m for m in model.modules() if isinstance(m, FixedBinarization)):
+        b = getattr(a, "_fused_thermometer_conv", None)
+        if (b is not None and b._lut is not None and b._lut.binary_input and id(b) not in paired
+                and not (a.thresh_jitter > 0.0 and a.thresh_jitter_mode == "indep")):
+            pairs.append((a, b))
+            paired.add(id(b))
+            _arm_with(model, a)
     for mod in model.modules():
         if isinstance(mod, torch.nn.Sequential):
             kids = list(mod.children())
             for a, b in zip(kids, kids[1:]):
                 if (isinstance(a, FixedBinarization) and isinstance(b, LogicConv2d)
-                        and b._lut is not None and b._lut.binary_input):
+                        and b._lut is not None and b._lut.binary_input and id(b) not in paired):
                     if a.thresh_jitter > 0.0 and a.thresh_jitter_mode == "indep":
                         continue                         # a post-compare flip: no fold
                     pairs.append((a, b))
@@ -188,7 +210,8 @@ def set_backend(model, lut_backend="torch", lut_compile=False, eval_backend="tor
     `fold` (H030): None = `fold_requested` (env `TORCHLOGIX_FOLD`, default off); with
     lut_backend="fused" the first conv takes the raw input of the FixedBinarization in front
     of it and computes the thermometer bits in its kernel. Pairs that cannot fold stay on the
-    materialised path and say why in `backend_report`.
+    materialised path and say why in `backend_report`. A fold that was requested for a fused model
+    and cannot apply to its first logic layer raises ValueError.
     """
     if lut_backend not in LUT_BACKENDS:
         raise ValueError(f"lut_backend must be one of {LUT_BACKENDS}, got {lut_backend!r}")
@@ -241,6 +264,7 @@ def set_backend(model, lut_backend="torch", lut_compile=False, eval_backend="tor
         for m in layers:
             if id(m) in notes:
                 m._lut.fold_note = notes[id(m)]
+                raise ValueError(f"fold requested but {notes[id(m)]}")
     elif fold_requested(fold):
         for m in layers[:1]:
             m._lut.fold_note = (f"not applied: lut_backend={lut_backend!r} (fold needs fused)"
